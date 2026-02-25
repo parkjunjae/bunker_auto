@@ -5,7 +5,7 @@ from rl_pid_training.rl_pid_env import PidGainEnv
 
 def main():
     # Gymnasium 환경 생성
-    env = PidGainEnv(odom_topic="/odom")
+    env = PidGainEnv()
 
     # stable-baselines3 학습 예시
     try:
