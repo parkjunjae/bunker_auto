@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>bunker_sim</name>
+  <version>0.0.1</version>
+  <description>Simple Gazebo Sim model for Bunker tracked robot (dimension-matched).</description>
+  <maintainer email="atoz@example.com">atoz</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
