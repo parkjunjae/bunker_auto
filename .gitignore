@@ -2,3 +2,6 @@ build/
 log/
 *.log
 install/
+
+src/bunker_ros2/
+src/ugv_sdk/
