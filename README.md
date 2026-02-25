@@ -98,63 +98,66 @@ ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1}, angular: {z:
 - 반드시 비상정지(E-Stop) 접근 가능한 상태에서 테스트
 - 바퀴가 뜬 상태 또는 충분히 넓은 공간에서 저속으로 시작
 
-# 3) PID 학습 파일 생성 (추론 전 단계, 시뮬 기준)
+# 3) PID 학습 (시뮬 기준, 분리 실행)
 
-아래 순서대로 실행합니다.
+아래 순서대로 각 터미널을 분리해서 실행합니다.
 
-### 3-1. 터미널 A: 시뮬 실행
+### 3-1. 터미널 A: 빌드 + 환경
 ```bash
 cd ~/ca_ws
-source /opt/ros/<distro>/setup.bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source ~/ca_ws/install/setup.bash
+```
+
+### 3-2. 터미널 B: Gazebo 시뮬 실행
+```bash
+source /opt/ros/humble/setup.bash
 source ~/ca_ws/install/setup.bash
 ros2 launch bunker_sim bunker_gz.launch.py
 ```
 
-### 3-2. 터미널 B: ros2_control 컨트롤러 활성화 확인
+### 3-3. 터미널 C: `controller_server` 단독 실행
 ```bash
-source /opt/ros/<distro>/setup.bash
+source /opt/ros/humble/setup.bash
 source ~/ca_ws/install/setup.bash
-ros2 control list_controllers
-ros2 control set_controller_state joint_state_broadcaster active
-ros2 control set_controller_state diff_drive_controller active
-```
 
-### 3-3. 터미널 C: controller_server 실행
-```bash
-source /opt/ros/<distro>/setup.bash
-source ~/ca_ws/install/setup.bash
-ros2 run nav2_controller controller_server \
-  --ros-args \
+ros2 run nav2_controller controller_server --ros-args \
   --params-file /home/atoz/ca_ws/src/rtabmap_ros/rtabmap_launch/launch/config/nav2_rtabmap_params_train.yaml \
   -p use_sim_time:=true \
-  -p odom_topic:=/diff_drive_controller/odom \
-  -r cmd_vel:=/diff_drive_controller/cmd_vel
+  -p controller_server.ros__parameters.odom_topic:=/odom
 ```
 
-### 3-4. 터미널 D: lifecycle manager로 controller_server 활성화
+### 3-4. 터미널 D: lifecycle manager로 `controller_server` 활성화
 ```bash
-source /opt/ros/<distro>/setup.bash
+source /opt/ros/humble/setup.bash
 source ~/ca_ws/install/setup.bash
-ros2 run nav2_lifecycle_manager lifecycle_manager \
-  --ros-args \
+
+ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args \
   -p use_sim_time:=true \
   -p autostart:=true \
   -p node_names:="[controller_server]"
 ```
 
-### 3-5. 터미널 E: 학습 실행
+### 3-5. 터미널 E: 학습 실행 (`odom` remap)
 ```bash
-source /opt/ros/<distro>/setup.bash
+source /opt/ros/humble/setup.bash
 source ~/ca_ws/install/setup.bash
-ros2 run rl_pid_training train_pid
+
+ros2 run rl_pid_training train_pid --ros-args \
+  -r /diff_drive_controller/odom:=/odom
 ```
 
-### 3-6. 학습 전 필수 체크
+### 3-6. 학습 전/중 체크
 ```bash
+# controller_server 상태
 ros2 lifecycle get /controller_server
-ros2 action list | grep follow_path
-ros2 topic list | grep desired_cmd
-ros2 service list | grep controller_server/set_parameters
+
+# FollowPath 액션 서버 존재 확인
+ros2 action list | grep /follow_path
+
+# 오돔/명령 토픽 확인
+ros2 topic list | egrep '^/odom$|^/cmd_vel$|desired_cmd'
 ```
 
 학습 결과 모델 저장 경로(코드 기본값):
@@ -162,9 +165,15 @@ ros2 service list | grep controller_server/set_parameters
 /home/atoz/ca_ws/rl_pid_model_new.zip
 ```
 
+필수 의존성(최초 1회):
+```bash
+python3 -m pip install --user -U gymnasium stable-baselines3
+```
+
 참고:
-- `train_pid.py`는 현재 `PidGainEnv()` 기본값을 사용하므로, 오도메트리 기본 토픽은 `/diff_drive_controller/odom`입니다.
-- 실행 전 `stable-baselines3`가 설치되어 있어야 합니다.
+- 현재 시뮬 브리지는 `/odom`, `/cmd_vel`을 사용합니다.
+- `PidGainEnv` 기본 odom은 `/diff_drive_controller/odom`이므로 학습 실행 시 remap이 필요합니다.
+- `cmd_vel`은 별도 remap 없이 기본 `/cmd_vel` 사용이면 됩니다.
 
 ## 4) 시뮬 "모터 정보" 수정 방향
 

@@ -279,18 +279,20 @@ class BunkerMotorProbe(Node):
                 print(f"  avg(all): rpm={rpm_all:+7.1f}, I={cur_all:+5.2f}A, dp/s={dpps_all_txt:>8}, cpr={cpr_all_txt}, n={a['n']}")
 
             if robot_rpm_w:
+                cpr_w_robot = (sum(robot_cpr_w) / len(robot_cpr_w)) if robot_cpr_w else float('nan')
                 print(
                     f"ROBOT avg(10s): rpm={sum(robot_rpm_w)/len(robot_rpm_w):+7.1f}, "
                     f"I={sum(robot_cur_w)/len(robot_cur_w):+5.2f}A, "
                     f"dp/s={sum(robot_dpps_w)/len(robot_dpps_w):+8.1f}, "
-                    f"cpr={sum(robot_cpr_w)/len(robot_cpr_w):.1f}"
+                    f"cpr={cpr_w_robot:.1f}"
                 )
             if robot_rpm_all:
+                cpr_all_robot = (sum(robot_cpr_all) / len(robot_cpr_all)) if robot_cpr_all else float('nan')
                 print(
                     f"ROBOT avg(all): rpm={sum(robot_rpm_all)/len(robot_rpm_all):+7.1f}, "
                     f"I={sum(robot_cur_all)/len(robot_cur_all):+5.2f}A, "
                     f"dp/s={sum(robot_dpps_all)/len(robot_dpps_all):+8.1f}, "
-                    f"cpr={sum(robot_cpr_all)/len(robot_cpr_all):.1f}"
+                    f"cpr={cpr_all_robot:.1f}"
                 )
 
             print('--- SEGMENT AVG ---')

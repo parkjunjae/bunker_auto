@@ -1,3 +1,4 @@
+import math
 import time
 from dataclasses import dataclass
 
@@ -9,6 +10,10 @@ from rcl_interfaces.srv import SetParameters
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from nav2_msgs.action import FollowPath
+try:
+    from bunker_msgs.msg import BunkerStatus
+except ImportError:
+    BunkerStatus = None
 
 try:
     import gymnasium as gym
@@ -57,6 +62,8 @@ class PidGainEnv(gym.Env):
         path_mode: str = "mixed",
         forward_dist: float = 2.0,
         turn_offset: float = 0.6,
+        motor_status_topic: str = "/bunker_status",
+        use_motor_encoder_obs: bool = True,
     ):
         super().__init__()
 
@@ -71,6 +78,13 @@ class PidGainEnv(gym.Env):
         self.odom_sub = self.node.create_subscription(Odometry, odom_topic, self._cb_odom, 10)
         self.desired_sub = self.node.create_subscription(
             TwistStamped, desired_cmd_topic, self._cb_desired, 10)
+        self.use_motor_encoder_obs = bool(use_motor_encoder_obs and BunkerStatus is not None)
+        self.status_sub = None
+        if self.use_motor_encoder_obs:
+            self.status_sub = self.node.create_subscription(
+                BunkerStatus, motor_status_topic, self._cb_motor_status, 10)
+        elif use_motor_encoder_obs and BunkerStatus is None:
+            self.node.get_logger().warn("bunker_msgs not available, motor/encoder obs disabled.")
 
         # FollowPath 액션 클라이언트 (Nav2 controller_server)
         self.follow_client = ActionClient(self.node, FollowPath, follow_path_action)
@@ -90,8 +104,10 @@ class PidGainEnv(gym.Env):
         self.turn_offset = turn_offset
         self.episode_idx = 0
 
-        # 상태(관측) = [v_ref, w_ref, v_meas, w_meas, e_v, e_w]
-        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(6,), dtype=float)
+        # 상태(관측) 기본 = [v_ref, w_ref, v_meas, w_meas, e_v, e_w]
+        # 옵션 확장 = + [motor_rpm_mean, motor_current_mean, encoder_pulse_rate_mean]
+        obs_dim = 9 if self.use_motor_encoder_obs else 6
+        self.observation_space = spaces.Box(low=-1.0e6, high=1.0e6, shape=(obs_dim,), dtype=float)
 
         # 행동 = PID 게인 증감 (kp_lin, ki_lin, kd_lin, kp_ang, ki_ang, kd_ang)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=float)
@@ -111,6 +127,11 @@ class PidGainEnv(gym.Env):
         self.w_ref = 0.0
         self.v_meas = 0.0
         self.w_meas = 0.0
+        self.motor_rpm_mean = 0.0
+        self.motor_current_mean = 0.0
+        self.encoder_pulse_rate_mean = 0.0
+        self._last_status_wall_t = None
+        self._last_mean_pulse = None
         self.last_w_meas = 0.0
         self.last_odom = None
 
@@ -133,6 +154,27 @@ class PidGainEnv(gym.Env):
     def _cb_desired(self, msg: TwistStamped):
         self.v_ref = msg.twist.linear.x
         self.w_ref = msg.twist.angular.z
+
+    def _cb_motor_status(self, msg):
+        if not msg.actuator_states:
+            return
+        now = time.monotonic()
+        rpms = [float(s.rpm) for s in msg.actuator_states]
+        currents = [float(s.current) for s in msg.actuator_states]
+        pulses = [float(s.pulse_count) for s in msg.actuator_states]
+
+        self.motor_rpm_mean = sum(rpms) / len(rpms)
+        self.motor_current_mean = sum(currents) / len(currents)
+
+        mean_pulse = sum(pulses) / len(pulses)
+        if self._last_status_wall_t is None or self._last_mean_pulse is None:
+            self.encoder_pulse_rate_mean = 0.0
+        else:
+            dt = now - self._last_status_wall_t
+            if dt > 1.0e-3:
+                self.encoder_pulse_rate_mean = (mean_pulse - self._last_mean_pulse) / dt
+        self._last_status_wall_t = now
+        self._last_mean_pulse = mean_pulse
 
     def _set_pid_params(self):
         params = [
@@ -187,7 +229,10 @@ class PidGainEnv(gym.Env):
     def _get_obs(self):
         e_v = self.v_ref - self.v_meas
         e_w = self.w_ref - self.w_meas
-        return [self.v_ref, self.w_ref, self.v_meas, self.w_meas, e_v, e_w]
+        base = [self.v_ref, self.w_ref, self.v_meas, self.w_meas, e_v, e_w]
+        if not self.use_motor_encoder_obs:
+            return base
+        return base + [self.motor_rpm_mean, self.motor_current_mean, self.encoder_pulse_rate_mean]
 
     def step(self, action):
         self._apply_action(action)
@@ -225,43 +270,68 @@ class PidGainEnv(gym.Env):
             self.node.get_logger().warn("odom not received, skip sending FollowPath")
             return
 
-        # 간단한 직진/회전 경로 생성
+        # 로봇 현재 자세 기준 경로 생성
         start = PoseStamped()
         start.header.frame_id = self.last_odom.header.frame_id
         start.header.stamp = self.last_odom.header.stamp
         start.pose = self.last_odom.pose.pose
 
-        # 에피소드마다 직진/회전을 섞어서 각속도 응답도 학습
+        # quaternion -> yaw
+        q = start.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
         mode = self.path_mode
         if mode == "mixed":
-            mode = "turn" if (self.episode_idx % 2 == 0) else "straight"
+            cycle = ("forward", "backward", "left", "right")
+            mode = cycle[(self.episode_idx - 1) % len(cycle)]
 
         path = Path()
         path.header.frame_id = start.header.frame_id
         path.header.stamp = start.header.stamp
         path.poses = [start]
 
-        if mode == "straight":
+        def append_local_goal(local_x: float, local_y: float):
             goal = PoseStamped()
             goal.header = start.header
             goal.pose = start.pose
-            goal.pose.position.x += self.forward_dist
+            # body(local) -> world 변환
+            goal.pose.position.x += local_x * math.cos(yaw) - local_y * math.sin(yaw)
+            goal.pose.position.y += local_x * math.sin(yaw) + local_y * math.cos(yaw)
             path.poses.append(goal)
-        else:
-            # 회전이 포함되도록 중간 점을 옆으로 치우친 경로 생성
-            sign = 1.0 if (self.episode_idx % 4 in (0, 1)) else -1.0
+
+        if mode in ("straight", "forward"):
+            append_local_goal(self.forward_dist, 0.0)
+        elif mode in ("backward", "reverse"):
+            append_local_goal(-self.forward_dist, 0.0)
+        elif mode == "left":
             mid = PoseStamped()
             mid.header = start.header
             mid.pose = start.pose
-            mid.pose.position.x += self.forward_dist * 0.5
-            mid.pose.position.y += sign * self.turn_offset
+            local_mid_x = self.forward_dist * 0.3
+            local_mid_y = self.turn_offset
+            mid.pose.position.x += local_mid_x * math.cos(yaw) - local_mid_y * math.sin(yaw)
+            mid.pose.position.y += local_mid_x * math.sin(yaw) + local_mid_y * math.cos(yaw)
             path.poses.append(mid)
-
-            goal = PoseStamped()
-            goal.header = start.header
-            goal.pose = start.pose
-            goal.pose.position.x += self.forward_dist
-            path.poses.append(goal)
+            append_local_goal(0.0, self.turn_offset)
+        elif mode == "right":
+            mid = PoseStamped()
+            mid.header = start.header
+            mid.pose = start.pose
+            local_mid_x = self.forward_dist * 0.3
+            local_mid_y = -self.turn_offset
+            mid.pose.position.x += local_mid_x * math.cos(yaw) - local_mid_y * math.sin(yaw)
+            mid.pose.position.y += local_mid_x * math.sin(yaw) + local_mid_y * math.cos(yaw)
+            path.poses.append(mid)
+            append_local_goal(0.0, -self.turn_offset)
+        else:
+            # 레거시 turn 모드 호환
+            sign = 1.0 if (self.episode_idx % 2 == 0) else -1.0
+            local_mid_x = self.forward_dist * 0.5
+            local_mid_y = sign * self.turn_offset
+            append_local_goal(local_mid_x, local_mid_y)
+            append_local_goal(self.forward_dist, 0.0)
 
         goal_msg = FollowPath.Goal()
         goal_msg.path = path
