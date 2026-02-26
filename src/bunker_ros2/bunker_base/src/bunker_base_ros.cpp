@@ -20,6 +20,7 @@ BunkerBaseRos::BunkerBaseRos(std::string node_name)
   this->declare_parameter("odom_frame", rclcpp::ParameterValue("odom"));
   this->declare_parameter("base_frame", rclcpp::ParameterValue("base_link"));
   this->declare_parameter("odom_topic_name", rclcpp::ParameterValue("odom"));
+  this->declare_parameter("publish_odom_tf", rclcpp::ParameterValue(true));
 
   this->declare_parameter("is_bunker_mini", rclcpp::ParameterValue(false));
   this->declare_parameter("simulated_robot", rclcpp::ParameterValue(false));
@@ -35,6 +36,7 @@ void BunkerBaseRos::LoadParameters() {
   this->get_parameter_or<std::string>("base_frame", base_frame_, "base_link");
   this->get_parameter_or<std::string>("odom_topic_name", odom_topic_name_,
                                       "odom");
+  this->get_parameter_or<bool>("publish_odom_tf", publish_odom_tf_, true);
   this->get_parameter_or<bool>("is_bunker_mini", is_bunker_mini_, false);
   this->get_parameter_or<bool>("simulated_robot", simulated_robot_, false);
   this->get_parameter_or<int>("control_rate", sim_control_rate_, 50);
@@ -44,6 +46,8 @@ void BunkerBaseRos::LoadParameters() {
   std::cout << "- odom frame name: " << odom_frame_ << std::endl;
   std::cout << "- base frame name: " << base_frame_ << std::endl;
   std::cout << "- odom topic name: " << odom_topic_name_ << std::endl;
+  std::cout << "- publish odom tf: " << std::boolalpha << publish_odom_tf_
+            << std::endl;
 
   std::cout << "- is bunker mini: " << std::boolalpha << is_bunker_mini_
             << std::endl;
@@ -96,6 +100,7 @@ void BunkerBaseRos::Run() {
   messenger->SetOdometryFrame(odom_frame_);
   messenger->SetBaseFrame(base_frame_);
   messenger->SetOdometryTopicName(odom_topic_name_);
+  messenger->SetPublishOdometryTf(publish_odom_tf_);
   if (simulated_robot_) messenger->SetSimulationMode(sim_control_rate_);
 
   // connect to robot and setup ROS subscription

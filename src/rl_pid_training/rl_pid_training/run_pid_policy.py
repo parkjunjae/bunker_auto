@@ -10,6 +10,17 @@ from stable_baselines3 import PPO
 from rl_pid_training.rl_pid_env_real import RealPidGainEnv
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -36,6 +47,17 @@ def main():
         "--desired-cmd-type",
         default="auto",
         help="desired_cmd 타입(auto|twist|twist_stamped)",
+    )
+    parser.add_argument(
+        "--motor-status-topic",
+        default="/bunker_status",
+        help="모터/엔코더 상태 토픽",
+    )
+    parser.add_argument(
+        "--use-motor-encoder-obs",
+        type=_as_bool,
+        default=True,
+        help="관측에 모터/엔코더 3개 피처를 포함할지 여부(true/false)",
     )
     parser.add_argument(
         "--use-sim-time",
@@ -150,6 +172,8 @@ def main():
         odom_topic=args.odom_topic,
         desired_cmd_topic=args.desired_cmd_topic,
         desired_cmd_type=args.desired_cmd_type,
+        motor_status_topic=args.motor_status_topic,
+        use_motor_encoder_obs=args.use_motor_encoder_obs,
         step_dt=args.step_dt,
         gain_scale=args.gain_scale,
         gain_lpf_alpha=args.gain_lpf_alpha,
@@ -191,6 +215,9 @@ def main():
         "w_ref",
         "v_meas",
         "w_meas",
+        "motor_rpm_mean",
+        "motor_current_mean",
+        "encoder_pulse_rate_mean",
         "reward",
     ]
 
@@ -220,6 +247,9 @@ def main():
                     env.w_ref,
                     env.v_meas,
                     env.w_meas,
+                    env.motor_rpm_mean,
+                    env.motor_current_mean,
+                    env.encoder_pulse_rate_mean,
                     reward,
                 ])
 

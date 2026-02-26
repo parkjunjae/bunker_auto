@@ -13,6 +13,8 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration("odom_topic")
     desired_cmd_topic = LaunchConfiguration("desired_cmd_topic")
     desired_cmd_type = LaunchConfiguration("desired_cmd_type")
+    motor_status_topic = LaunchConfiguration("motor_status_topic")
+    use_motor_encoder_obs = LaunchConfiguration("use_motor_encoder_obs")
     use_sim_time = LaunchConfiguration("use_sim_time")
     python_exec = LaunchConfiguration("python_exec")
     step_dt = LaunchConfiguration("step_dt")
@@ -43,6 +45,10 @@ def generate_launch_description():
         desired_cmd_topic,
         "--desired-cmd-type",
         desired_cmd_type,
+        "--motor-status-topic",
+        motor_status_topic,
+        "--use-motor-encoder-obs",
+        use_motor_encoder_obs,
         "--step-dt",
         step_dt,
         "--gain-scale",
@@ -115,6 +121,16 @@ def generate_launch_description():
                 "desired_cmd_type",
                 default_value="auto",
                 description="desired_cmd 타입(auto|twist|twist_stamped)",
+            ),
+            DeclareLaunchArgument(
+                "motor_status_topic",
+                default_value="/bunker_status",
+                description="모터/엔코더 상태 토픽",
+            ),
+            DeclareLaunchArgument(
+                "use_motor_encoder_obs",
+                default_value="true",
+                description="관측에 모터/엔코더 피처 포함 여부(true/false)",
             ),
             DeclareLaunchArgument(
                 "use_sim_time",

@@ -36,6 +36,7 @@ class BunkerMessenger {
   void SetOdometryFrame(std::string frame) { odom_frame_ = frame; }
   void SetBaseFrame(std::string frame) { base_frame_ = frame; }
   void SetOdometryTopicName(std::string name) { odom_topic_name_ = name; }
+  void SetPublishOdometryTf(bool enable) { publish_odom_tf_ = enable; }
 
   void SetSimulationMode(int loop_rate) {
     simulated_robot_ = true;
@@ -147,6 +148,7 @@ class BunkerMessenger {
   std::string odom_frame_;
   std::string base_frame_;
   std::string odom_topic_name_;
+  bool publish_odom_tf_ = true;
 
   bool simulated_robot_ = false;
   int sim_control_rate_ = 50;
@@ -216,18 +218,20 @@ class BunkerMessenger {
     geometry_msgs::msg::Quaternion odom_quat =
         createQuaternionMsgFromYaw(theta_);
 
-    // publish tf transformation
-    geometry_msgs::msg::TransformStamped tf_msg;
-    tf_msg.header.stamp = current_time_;
-    tf_msg.header.frame_id = odom_frame_;
-    tf_msg.child_frame_id = base_frame_;
+    if (publish_odom_tf_ && tf_broadcaster_) {
+      // publish tf transformation
+      geometry_msgs::msg::TransformStamped tf_msg;
+      tf_msg.header.stamp = current_time_;
+      tf_msg.header.frame_id = odom_frame_;
+      tf_msg.child_frame_id = base_frame_;
 
-    tf_msg.transform.translation.x = position_x_;
-    tf_msg.transform.translation.y = position_y_;
-    tf_msg.transform.translation.z = 0.0;
-    tf_msg.transform.rotation = odom_quat;
+      tf_msg.transform.translation.x = position_x_;
+      tf_msg.transform.translation.y = position_y_;
+      tf_msg.transform.translation.z = 0.0;
+      tf_msg.transform.rotation = odom_quat;
 
-    tf_broadcaster_->sendTransform(tf_msg);
+      tf_broadcaster_->sendTransform(tf_msg);
+    }
 
     // publish odometry and tf messages
     nav_msgs::msg::Odometry odom_msg;

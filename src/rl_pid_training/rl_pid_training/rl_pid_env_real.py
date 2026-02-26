@@ -7,6 +7,10 @@ from rclpy.parameter import Parameter
 from rcl_interfaces.srv import SetParameters
 from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
+try:
+    from bunker_msgs.msg import BunkerStatus
+except ImportError:
+    BunkerStatus = None
 
 try:
     import gymnasium as gym
@@ -66,6 +70,8 @@ class RealPidGainEnv(gym.Env):
         dither_w_ref_thresh: float = 0.15,  # anti-dither 대상 최소 회전 크기
         w_ref_sign_hold_sec: float = 0.50,  # 부호 유지 시간을 늘려 좌우 반전 억제
         w_ref_abs_max_low_speed: float = 0.30,  # 저속 회전 상한을 낮춰 급회전 방지
+        motor_status_topic: str = "/bunker_status",
+        use_motor_encoder_obs: bool = True,
         param_wait_sec: float = 15.0,
         use_sim_time: bool = False,
     ):
@@ -87,6 +93,18 @@ class RealPidGainEnv(gym.Env):
         # 토픽 타입을 자동 감지하거나, 필요 시 파라미터로 고정
         self.desired_cmd_type = desired_cmd_type
         self.desired_sub = self._subscribe_desired(desired_cmd_topic, self.desired_cmd_type)
+
+        # 모터/엔코더 상태(학습 모델 9차원 관측과 shape 일치)
+        self.use_motor_encoder_obs = bool(use_motor_encoder_obs)
+        if self.use_motor_encoder_obs and BunkerStatus is None:
+            raise RuntimeError(
+                "use_motor_encoder_obs=true 이지만 bunker_msgs.msg.BunkerStatus를 import할 수 없습니다."
+            )
+        self.status_sub = None
+        if self.use_motor_encoder_obs:
+            self.status_sub = self.node.create_subscription(
+                BunkerStatus, motor_status_topic, self._cb_motor_status, 10
+            )
 
         # 컨트롤러 파라미터 서비스
         self.param_srv = f"{controller_node}/set_parameters"
@@ -114,8 +132,9 @@ class RealPidGainEnv(gym.Env):
         self.w_ref_sign_hold_sec = w_ref_sign_hold_sec
         self.w_ref_abs_max_low_speed = w_ref_abs_max_low_speed
 
-        # 상태(관측) = [v_ref, w_ref, v_meas, w_meas, e_v, e_w]
-        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(6,), dtype=float)
+        # 상태(관측) = [v_ref, w_ref, v_meas, w_meas, e_v, e_w] + [rpm_mean, current_mean, pulse_rate_mean]
+        obs_dim = 9 if self.use_motor_encoder_obs else 6
+        self.observation_space = spaces.Box(low=-1.0e6, high=1.0e6, shape=(obs_dim,), dtype=float)
 
         # 행동 = PID 게인 증감 (kp_lin, ki_lin, kd_lin, kp_ang, ki_ang, kd_ang)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=float)
@@ -140,6 +159,11 @@ class RealPidGainEnv(gym.Env):
         self._last_turn_sign_change_ts = 0.0
         self.v_meas = 0.0
         self.w_meas = 0.0
+        self.motor_rpm_mean = 0.0
+        self.motor_current_mean = 0.0
+        self.encoder_pulse_rate_mean = 0.0
+        self._last_status_wall_t = None
+        self._last_mean_pulse = None
         self.last_w_meas = 0.0
 
     def _wait_for_param_service(self, timeout_sec: float) -> bool:
@@ -154,6 +178,27 @@ class RealPidGainEnv(gym.Env):
     def _cb_odom(self, msg: Odometry):
         self.v_meas = msg.twist.twist.linear.x
         self.w_meas = msg.twist.twist.angular.z
+
+    def _cb_motor_status(self, msg):
+        if not msg.actuator_states:
+            return
+        now = time.monotonic()
+        rpms = [float(s.rpm) for s in msg.actuator_states]
+        currents = [float(s.current) for s in msg.actuator_states]
+        pulses = [float(s.pulse_count) for s in msg.actuator_states]
+
+        self.motor_rpm_mean = sum(rpms) / len(rpms)
+        self.motor_current_mean = sum(currents) / len(currents)
+
+        mean_pulse = sum(pulses) / len(pulses)
+        if self._last_status_wall_t is None or self._last_mean_pulse is None:
+            self.encoder_pulse_rate_mean = 0.0
+        else:
+            dt = now - self._last_status_wall_t
+            if dt > 1.0e-3:
+                self.encoder_pulse_rate_mean = (mean_pulse - self._last_mean_pulse) / dt
+        self._last_status_wall_t = now
+        self._last_mean_pulse = mean_pulse
 
     def _update_desired(self, v_ref: float, w_ref: float):
         """desired_cmd를 저속 anti-dither 규칙으로 안정화해 내부 참조값으로 사용."""
@@ -319,7 +364,10 @@ class RealPidGainEnv(gym.Env):
     def _get_obs(self):
         e_v = self.v_ref - self.v_meas
         e_w = self.w_ref - self.w_meas
-        return [self.v_ref, self.w_ref, self.v_meas, self.w_meas, e_v, e_w]
+        base = [self.v_ref, self.w_ref, self.v_meas, self.w_meas, e_v, e_w]
+        if not self.use_motor_encoder_obs:
+            return base
+        return base + [self.motor_rpm_mean, self.motor_current_mean, self.encoder_pulse_rate_mean]
 
     def step(self, action):
         self._apply_action(action)

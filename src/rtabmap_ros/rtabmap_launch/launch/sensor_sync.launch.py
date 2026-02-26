@@ -163,17 +163,17 @@ def generate_launch_description():
             description='LiDAR timestamp offset in seconds. Measure: now - lidar_stamp'),
 
         # Livox 마운트 위치 (base_link 기준)
-        DeclareLaunchArgument('livox_x', default_value='0.0'),
+        DeclareLaunchArgument('livox_x', default_value='0.3'),  # 전방 30cm
         DeclareLaunchArgument('livox_y', default_value='0.0'),
-        DeclareLaunchArgument('livox_z', default_value='0.83'),  # 로봇 위 83cm (12cm 낮춤)
+        DeclareLaunchArgument('livox_z', default_value='0.63'),  # 로봇 위 63cm
         DeclareLaunchArgument('livox_roll', default_value='0.0'),
         DeclareLaunchArgument('livox_pitch', default_value='0.0'),
         DeclareLaunchArgument('livox_yaw', default_value='0.0'),
 
         # Camera 마운트 위치 (base_link 기준)
-        DeclareLaunchArgument('camera_x', default_value='0.2'),  # 전방 20cm
+        DeclareLaunchArgument('camera_x', default_value='0.3'),  # 전방 30cm
         DeclareLaunchArgument('camera_y', default_value='0.0'),
-        DeclareLaunchArgument('camera_z', default_value='0.58'),  # 로봇 위 58cm (12cm 낮춤)
+        DeclareLaunchArgument('camera_z', default_value='0.55'),  # 로봇 위 55cm
         DeclareLaunchArgument('camera_roll', default_value='0.0'),
         DeclareLaunchArgument('camera_pitch', default_value='0.0'),
         DeclareLaunchArgument('camera_yaw', default_value='0.0'),
