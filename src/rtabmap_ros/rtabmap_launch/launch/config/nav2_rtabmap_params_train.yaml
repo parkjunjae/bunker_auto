@@ -105,6 +105,14 @@ controller_server:
       in_place_heading: 0.7
       # 제자리 회전 최소 각속도(rad/s)
       min_turn_rate: 0.2
+      # 제자리 회전 허용 조건(좁은 통로 충돌 방지)
+      rotate_min_side_clearance: 0.42
+      rotate_min_front_clearance: 0.32
+      # 좁은 구간 탈출(전진 우선, 필요시 후진)
+      escape_forward_speed: 0.05
+      escape_forward_turn_scale: 0.6
+      escape_use_reverse: true
+      escape_reverse_speed: 0.03
       slow_dist: 1.2
       #------------------------------
       heading_gain: 0.6

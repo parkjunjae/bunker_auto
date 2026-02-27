@@ -139,23 +139,23 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "step_dt",
-                default_value="0.4",
+                default_value="0.6",
                 description="agent PID 갱신 주기(초), 클수록 덜 민감",
             ),
             DeclareLaunchArgument(
                 "gain_scale",
-                default_value="0.2",
+                default_value="0.08",
                 description="게인 증감 스케일(작을수록 덜 흔들림)",
             ),
             DeclareLaunchArgument(
                 "gain_lpf_alpha",
-                default_value="0.18",
-                description="게인 저역통과 계수(0~1)",
+                default_value="0.08",
+                description="게인 저역통과 계수(0~1) 게인 변경을 저역통과해서 “천천히” 변하게 함.",
             ),
             DeclareLaunchArgument(
                 "action_deadzone",
-                default_value="0.25",
-                description="행동 deadzone(절대값 이하면 무시)",
+                default_value="0.35",
+                description="행동 deadzone(절대값 이하면 무시) 작은 정책 출력은 무시해서 미세 떨림 제거.",
             ),
             DeclareLaunchArgument(
                 "straight_freeze_w_ref",
@@ -191,14 +191,14 @@ def generate_launch_description():
             # 저속 좌우 떨림 억제용 w_ref 가드(로그 기반 기본값)
             DeclareLaunchArgument(
                 "w_ref_lpf_alpha",
-                default_value="0.18",
+                default_value="0.10",
                 description="w_ref 저역통과 계수(작을수록 더 부드러움)",
             ),
             #-----------------
             DeclareLaunchArgument(
                 "w_ref_deadband",
-                default_value="0.06",
-                description="|w_ref| deadband(rad/s): 이하면 0으로 처리",
+                default_value="0.08",
+                description="|w_ref| deadband(rad/s): 이하면 0으로 처리, 아주 작은 회전 명령은 0으로 처리(제자리 미세 떨림 방지).",
             ),
             DeclareLaunchArgument(
                 "dither_v_ref_thresh",
@@ -207,8 +207,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "dither_w_ref_thresh",
-                default_value="0.15",
-                description="anti-dither 대상 최소 |w_ref|(rad/s)",
+                default_value="0.20",
+                description="anti-dither 대상 최소 |w_ref|(rad/s) 이 값 이하의 작은 회전 요구에는 과민반응하지 않게 함",
             ),
             #-----------------
             DeclareLaunchArgument(

@@ -42,6 +42,24 @@ void RlLocalController::configure(
   nav2_util::declare_parameter_if_not_declared(
     node_, name_ + ".min_turn_rate", rclcpp::ParameterValue(min_turn_rate_));
   nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".rotate_min_side_clearance",
+    rclcpp::ParameterValue(rotate_min_side_clearance_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".rotate_min_front_clearance",
+    rclcpp::ParameterValue(rotate_min_front_clearance_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".escape_forward_speed",
+    rclcpp::ParameterValue(escape_forward_speed_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".escape_forward_turn_scale",
+    rclcpp::ParameterValue(escape_forward_turn_scale_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".escape_use_reverse",
+    rclcpp::ParameterValue(escape_use_reverse_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".escape_reverse_speed",
+    rclcpp::ParameterValue(escape_reverse_speed_));
+  nav2_util::declare_parameter_if_not_declared(
     node_, name_ + ".slow_dist", rclcpp::ParameterValue(slow_dist_));
   nav2_util::declare_parameter_if_not_declared(
     node_, name_ + ".heading_gain", rclcpp::ParameterValue(heading_gain_));
@@ -100,6 +118,12 @@ void RlLocalController::configure(
   node_->get_parameter(name_ + ".creep_speed", creep_speed_);
   node_->get_parameter(name_ + ".in_place_heading", in_place_heading_);
   node_->get_parameter(name_ + ".in_place_dist", in_place_dist_);
+  node_->get_parameter(name_ + ".rotate_min_side_clearance", rotate_min_side_clearance_);
+  node_->get_parameter(name_ + ".rotate_min_front_clearance", rotate_min_front_clearance_);
+  node_->get_parameter(name_ + ".escape_forward_speed", escape_forward_speed_);
+  node_->get_parameter(name_ + ".escape_forward_turn_scale", escape_forward_turn_scale_);
+  node_->get_parameter(name_ + ".escape_use_reverse", escape_use_reverse_);
+  node_->get_parameter(name_ + ".escape_reverse_speed", escape_reverse_speed_);
   node_->get_parameter(name_ + ".slow_dist", slow_dist_);
   node_->get_parameter(name_ + ".heading_gain", heading_gain_);
   node_->get_parameter(name_ + ".heading_slow_angle", heading_slow_angle_);
@@ -265,7 +289,43 @@ geometry_msgs::msg::TwistStamped RlLocalController::computeVelocityCommands(
 
   // 좌우 차이 데드밴드로 진동을 줄인다.
   const double lr_diff = left - right;
-  if (align_in_place_mode_ && front > hard_stop_dist_) {
+  const double side_min = std::min(left, right);
+  const bool can_in_place_rotate =
+    side_min >= rotate_min_side_clearance_ &&
+    front >= rotate_min_front_clearance_;
+
+  if (align_in_place_mode_ && !can_in_place_rotate) {
+    // 좁은 통로에서는 즉시 제자리 회전을 금지하고 탈출 기동으로 여유 공간을 만든다.
+    const bool front_has_room = front > std::max(stop_dist_ + 0.05, hard_stop_dist_ + 0.10);
+    if (front_has_room) {
+      v_des = std::max(0.0, escape_forward_speed_);
+      // 더 넓은 쪽으로 약하게 틀어 측면 여유를 확보한다.
+      double turn_dir = 0.0;
+      if (std::abs(lr_diff) >= turn_deadband_) {
+        turn_dir = (lr_diff > 0.0) ? 1.0 : -1.0;
+      } else if (last_turn_dir_ != 0) {
+        turn_dir = static_cast<double>(last_turn_dir_);
+      }
+      if (std::abs(turn_dir) > 0.0) {
+        w_des = turn_dir * min_turn_rate_ * clamp(escape_forward_turn_scale_, 0.0, 1.0);
+      }
+    } else if (escape_use_reverse_) {
+      // 전방도 막혀 있으면 매우 저속 후진+회전으로 공간을 다시 확보한다.
+      v_des = -std::max(0.0, escape_reverse_speed_);
+      double turn_dir = 0.0;
+      if (std::abs(lr_diff) >= turn_deadband_) {
+        turn_dir = (lr_diff > 0.0) ? 1.0 : -1.0;
+      } else {
+        turn_dir = heading_error >= 0.0 ? 1.0 : -1.0;
+      }
+      last_turn_dir_ = (turn_dir >= 0.0) ? 1 : -1;
+      w_des = turn_dir * min_turn_rate_;
+    } else {
+      // 후진 탈출을 비활성화한 경우에는 정지해 상위 복구(BackUp 등)에 맡긴다.
+      v_des = 0.0;
+      w_des = 0.0;
+    }
+  } else if (align_in_place_mode_ && front > hard_stop_dist_) {
     // 근거리 정렬 모드: 선속도를 완전히 차단해 원운동 대신 제자리 회전으로 맞춘다.
     v_des = 0.0;
     const double turn_dir = heading_error >= 0.0 ? 1.0 : -1.0;

@@ -106,6 +106,14 @@ controller_server:
       in_place_dist: 0.5  # 가까운 목표에서 제자리 회전 유도
       # 제자리 회전 최소 각속도(rad/s)
       min_turn_rate: 0.25  # 최소 회전각속도 상향(급턴 전 선제 회전)
+      # 제자리 회전 허용 조건(좁은 통로 충돌 방지)
+      rotate_min_side_clearance: 0.42
+      rotate_min_front_clearance: 0.32
+      # 좁은 구간 탈출(전진 우선, 필요시 후진)
+      escape_forward_speed: 0.05
+      escape_forward_turn_scale: 0.6
+      escape_use_reverse: true
+      escape_reverse_speed: 0.03
       slow_dist: 1.2
       #------------------------------
       heading_gain: 0.85  # 방향 추종 강화(완만 곡선 완화)
@@ -200,8 +208,13 @@ waypoint_follower:
 velocity_smoother:
   ros__parameters:
     use_sim_time: false
-    smoothing_frequency: 20.0
+    smoothing_frequency: 30.0
     scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_accel: [0.25, 0.0, 0.8]
+    max_decel: [-0.25, 0.0, -0.8]
+    deadband_velocity: [0.0, 0.0, 0.02]
+
 
 # ==============================================================================
 # 로컬 코스트맵: 실시간 장애물 회피용

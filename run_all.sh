@@ -131,6 +131,8 @@ run_ros "livox" "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
 sleep "$SLEEP_SEC"
 run_realsense "realsense" "ros2 launch realsense2_camera rs_launch.py"
 sleep "$SLEEP_SEC"
+run_ros "ec25_gps" "ros2 launch ec25_gps_bridge ec25_gps_bridge.launch.py"
+sleep "$SLEEP_SEC"
 
 # 3) Base + sync + EKF
 run_ros "bunker_base" "ros2 launch bunker_base bunker_base.launch.py"

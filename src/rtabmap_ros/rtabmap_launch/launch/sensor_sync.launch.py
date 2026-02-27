@@ -106,9 +106,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'fixed_frame_id': 'base_link',  # odom 대신 base_link 사용
-            'queue_size': 5,
+            'queue_size': 3,
             'qos': 2,
-            'wait_for_transform': 0.2,  # 0.5 → 0.2 (더 엄격)
+            'wait_for_transform': 0.05,  # 0.5 → 0.2 (더 엄격)
             'slerp': True,
             'use_sim_time': use_sim_time,
         }],
@@ -159,7 +159,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='false'),
 
         # LiDAR 타임스탬프 오프셋 (측정 후 조정 필요)
-        DeclareLaunchArgument('lidar_offset_sec', default_value='0.018',
+        DeclareLaunchArgument('lidar_offset_sec', default_value='0.003',
             description='LiDAR timestamp offset in seconds. Measure: now - lidar_stamp'),
 
         # Livox 마운트 위치 (base_link 기준)

@@ -94,6 +94,18 @@ private:
   double in_place_dist_{0.8};
   // 제자리 회전 최소 각속도(rad/s)
   double min_turn_rate_{0.4};
+  // 제자리 회전을 허용할 최소 좌/우 여유 거리(m)
+  double rotate_min_side_clearance_{0.45};
+  // 제자리 회전을 허용할 최소 전방 여유 거리(m)
+  double rotate_min_front_clearance_{0.30};
+  // 좁은 구간 탈출용 전진 속도(m/s)
+  double escape_forward_speed_{0.06};
+  // 탈출 전진 시 회전 비율(0~1)
+  double escape_forward_turn_scale_{0.6};
+  // 좁은 구간에서 후진 탈출 허용 여부
+  bool escape_use_reverse_{true};
+  // 좁은 구간 탈출용 후진 속도(m/s)
+  double escape_reverse_speed_{0.04};
   double slow_dist_{1.2};
   double heading_gain_{1.0};
   // heading 오차가 클 때 전진 속도를 줄이는 기준 각도(rad)
