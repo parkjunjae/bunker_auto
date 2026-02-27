@@ -95,11 +95,11 @@ controller_server:
       max_ang: 1.0
       # ---- 장애물 근접 감속/정지 거리-------
       # 전방이 이 거리보다 가까우면 회전/크립 모드로 전환
-      stop_dist: 0.4
+      stop_dist: 0.30
       # 전방이 너무 가까우면 완전 정지
-      hard_stop_dist: 0.25
+      hard_stop_dist: 0.18
       # 막힘 상태에서 천천히 전진하며 재탐색
-      creep_speed: 0.02
+      creep_speed: 0.04
       # 제자리 회전으로 정렬할 heading 오차(rad)
       in_place_heading: 0.8  # 가까운 목표에서 더 빨리 제자리 회전
       # 목표 근처에서만 제자리 회전을 허용할 거리(m)
@@ -211,9 +211,9 @@ velocity_smoother:
     smoothing_frequency: 30.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_accel: [0.25, 0.0, 0.8]
-    max_decel: [-0.25, 0.0, -0.8]
-    deadband_velocity: [0.0, 0.0, 0.02]
+    max_accel: [0.35, 0.0, 0.8]
+    max_decel: [-0.35, 0.0, -0.8]
+    deadband_velocity: [0.0, 0.0, 0.005]
 
 
 # ==============================================================================

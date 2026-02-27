@@ -69,7 +69,7 @@ def generate_launch_description():
         parameters=[{
             'input_topic': '/camera/camera/imu',
             'output_topic': '/camera/camera/imu_bias_corrected',
-            'target_frame': '',  # 프레임 변환 안 함
+            'target_frame': 'base_link',  # 프레임 변환 안 함
             'tf_timeout_sec': 0.05,
             'calib_samples': 1000,
             'stationary_threshold': 0.01,
@@ -105,7 +105,7 @@ def generate_launch_description():
         name='lidar_deskewing',
         output='screen',
         parameters=[{
-            'fixed_frame_id': 'base_link',  # odom 대신 base_link 사용
+            'fixed_frame_id': 'odom',  # odom 대신 base_link 사용
             'queue_size': 3,
             'qos': 2,
             'wait_for_transform': 0.05,  # 0.5 → 0.2 (더 엄격)

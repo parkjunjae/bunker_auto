@@ -27,13 +27,13 @@ ekf_filter_node:
         false, # z
         false, # roll
         false, # pitch
-        true, # yaw (회전은 IMU를 신뢰)
+        false, # yaw (휠 오돔 yaw로 정지 드리프트 억제)
         true, # vx
         false, # vy
         false, # vz
         false, # vroll
         false, # vpitch
-        false, # vyaw (회전속도도 IMU를 신뢰)
+        false, # vyaw (제자리 회전 슬립 영향 완화를 위해 비활성)
         false, # ax
         false, # ay
         false, # az
@@ -43,7 +43,7 @@ ekf_filter_node:
     imu0: /camera/camera/imu_fixed # 보정된 IMU 토픽
     imu0_queue_size: 200 # IMU 큐 크기(고주파 센서라 크게 설정)
     imu0_differential: false # 절대 orientation/각속도 사용
-    imu0_relative: true # 초기값 기준 상대 orientation 사용(시작 자세 오프셋 완화)
+    imu0_relative: false # 상대 누적을 끄고 yaw rate만 보조로 사용
     imu0_remove_gravitational_acceleration: false # 가속도에서 중력 성분 제거 여부
     # imu0_config 순서는 odom0_config와 동일
     imu0_config: [

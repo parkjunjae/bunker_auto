@@ -223,7 +223,7 @@ def generate_launch_description():
                              description='[m] remove near-range noisy returns'),
         DeclareLaunchArgument('dynamic_target_frame', default_value='odom',
                              description='Accumulation frame for dynamic filter (odom or map)'),
-        DeclareLaunchArgument('dynamic_tf_timeout_sec', default_value='0.05',
+        DeclareLaunchArgument('dynamic_tf_timeout_sec', default_value='0.12',
                              description='TF lookup timeout for dynamic filter'),
         # Keep args empty to avoid overriding ROS params.
         DeclareLaunchArgument('rtabmap_args', default_value='', description='Extra CLI flags for rtabmap'),

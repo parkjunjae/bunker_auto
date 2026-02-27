@@ -139,12 +139,12 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "step_dt",
-                default_value="0.6",
+                default_value="0.4",
                 description="agent PID 갱신 주기(초), 클수록 덜 민감",
             ),
             DeclareLaunchArgument(
                 "gain_scale",
-                default_value="0.08",
+                default_value="0.05",
                 description="게인 증감 스케일(작을수록 덜 흔들림)",
             ),
             DeclareLaunchArgument(
@@ -154,7 +154,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "action_deadzone",
-                default_value="0.35",
+                default_value="0.20",
                 description="행동 deadzone(절대값 이하면 무시) 작은 정책 출력은 무시해서 미세 떨림 제거.",
             ),
             DeclareLaunchArgument(

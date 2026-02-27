@@ -1,4 +1,4 @@
-# ca_ws 실행/튜닝 가이드 (2026-02-26 업데이트)
+# ca_ws 실행/튜닝 가이드 (2026-02-27 업데이트)
 
 이 문서는 오늘 반영된 변경사항 기준으로 정리합니다.
 
@@ -13,6 +13,7 @@
 - 좁은 통로 제자리 회전 방지(escape)
 - PID CSV 시각화
 - RealSense IMU(HID/IIO) 커널 모듈 빌드/설치
+- 맵 뒤틀림(회전 드리프트) 이슈 대응 기록
 
 ## 1) 빌드
 
@@ -144,6 +145,20 @@ ros2 launch rtabmap_launch sensor_sync.launch.py lidar_offset_sec:=0.003
 가이드:
 - `/livox/lidar/synced`는 1~5ms 수준이면 양호
 - `/livox/lidar/synced/deskewed`는 deskew 처리로 수~수십 ms 지연이 정상
+
+라이다-카메라 상대 타임스탬프(헤더) 정합 측정:
+```bash
+python3 ~/ca_ws/tools/lidar_camera_sync_probe.py \
+  --camera-topic /camera/camera/aligned_depth_to_color/image_raw \
+  --lidar-topic /livox/lidar/synced/deskewed \
+  --current-lidar-offset 0.003 \
+  --duration-sec 30
+```
+
+출력의 `recommended lidar_offset_sec (median)` 값을 다음 실행에 반영:
+```bash
+ros2 launch rtabmap_launch sensor_sync.launch.py lidar_offset_sec:=<추천값>
+```
 
 ## 6) Nav2 footprint 최신값 (Bunker 규격 반영)
 
@@ -316,3 +331,92 @@ sudo modprobe hid_sensor_gyro_3d
 - 명령은 큰데 실측이 거의 0
 - 모터/엔코더가 장시간 0 고정
 - 엔코더 rate의 비정상 스파이크 과다
+
+## 11) 맵 뒤틀림(회전 드리프트) 이슈 대응 기록
+
+증상:
+- 제자리 회전 또는 코너 구간 이후, 동일 벽이 기울어져 중첩되며 맵이 비틀린 것처럼 보임
+- local/global costmap 문제처럼 보일 수 있으나, 실제로는 yaw 추정 + 정합(등록) + 시간동기 영향이 겹친 경우가 많음
+
+### 11-1) 반영/확인한 항목
+
+TF/상태추정:
+- `bunker_base`의 `publish_odom_tf:=false` 유지 (중복 TF publish 방지)
+- EKF가 `odom -> base_link` 단일 publish (`publish_tf: true`)
+- EKF yaw 입력 정리:
+- `odom0_config`: `yaw=false`, `vyaw=false`
+- `imu0_config`: `yaw=false`, `vyaw=true`
+
+IMU/센서 프레임:
+- `imu_bias_corrector` 출력 프레임을 `base_link`로 통일
+- `/camera/camera/imu_fixed`의 `frame_id=base_link` 확인
+- 센서 정적 TF 실측 반영:
+- `base_link -> livox_frame`: `x=0.30, y=0.00, z=0.63`
+- `base_link -> camera_link`: `x=0.30, y=0.00, z=0.55`
+
+RTAB-Map 파라미터(드리프트 완화용):
+- `RGBD/ProximityBySpace=true`
+- `RGBD/ProximityMaxGraphDepth=15`
+- `RGBD/LinearUpdate=0.15`
+- `RGBD/AngularUpdate=0.20`
+- `Rtabmap/DetectionRate=3.0`
+- `Rtabmap/LoopThr=0.30`
+- `RGBD/OptimizeMaxError=0.3`
+- `Reg/Force3DoF=true`
+- `Optimizer/Strategy=1` 설정
+
+### 11-2) 추가 진단 스크립트
+
+`tools/ekf_yaw_probe.py`:
+- 입력 비교: `/odometry/filtered`(EKF), `/odom`(wheel), `/camera/camera/imu_fixed`(IMU), `/cmd_vel`
+- 출력: `~/ca_ws/logs/ekf_yaw_probe_*.csv`
+- 목적: 제자리 회전 구간에서 EKF yaw/wz가 IMU 대비 얼마나 벗어나는지 수치로 확인
+
+실행:
+```bash
+python3 ~/ca_ws/tools/ekf_yaw_probe.py --duration 180 --rate 20
+```
+
+### 11-3) 현재 로그에서 확인된 핵심 원인
+
+- RTAB-Map 런타임에서 `g2o optimizer not available. TORO will be used instead.` 확인
+- 일부 세션에서 `Messages ... arrived out of order` 경고 확인 (RGBD 동기 불안정 신호)
+- 초기 기동 직후 `dynamic_object_filter`의 `livox_frame -> odom` TF 실패가 1회 발생할 수 있음 (초기화 타이밍 이슈)
+
+### 11-4) 우선순위 조치
+
+1. g2o 설치 후 RTAB-Map 재빌드로 `Strategy=1` 실제 적용 확인
+2. 맵 안정화 1차 검증은 LiDAR-only (`rgbd_sync:=false`, `subscribe_rgbd:=false`)로 A/B 테스트
+3. RGBD 재투입 전, out-of-order 경고와 센서 타임스탬프 정합 재확인
+4. deskew 고정 프레임은 `base_link`/`odom`을 각각 짧게 A/B 테스트하여 실제 왜곡이 적은 쪽 채택
+
+g2o 소스 빌드/재빌드 예시:
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libeigen3-dev libsuitesparse-dev
+
+mkdir -p ~/third_party && cd ~/third_party
+git clone https://github.com/RainerKuemmerle/g2o.git
+cd g2o
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=ON \
+  -DG2O_BUILD_APPS=OFF \
+  -DG2O_BUILD_EXAMPLES=OFF \
+  -DG2O_USE_OPENGL=OFF \
+  -DG2O_USE_CHOLMOD=ON
+cmake --build build -j"$(nproc)"
+sudo cmake --install build
+sudo ldconfig
+
+cd ~/ca_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install \
+  --packages-up-to rtabmap_ros \
+  --cmake-clean-cache \
+  --cmake-args \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DWITH_G2O=ON \
+    -DG2O_DIR=/usr/local/lib/cmake/g2o
+source ~/ca_ws/install/setup.bash
+```
