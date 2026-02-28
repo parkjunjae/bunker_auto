@@ -1,6 +1,6 @@
 ekf_filter_node:
   ros__parameters:
-    frequency: 20.0 # EKF 출력/예측 주기(Hz)
+    frequency: 50.0 # EKF 출력/예측 주기(Hz) - 20→50: TF 보간 정밀도 향상(50ms→20ms), deskewing 오차 감소
     sensor_timeout: 0.2 # 이 시간(sec) 동안 센서 입력이 없으면 해당 센서를 일시적으로 무시
 
     two_d_mode: true # 평면 주행 모드( z, roll, pitch 축을 0으로 고정 )
@@ -12,7 +12,7 @@ ekf_filter_node:
 
     publish_tf: true # odom -> base_link TF를 EKF가 직접 publish
     transform_time_offset: 0.0 # TF 타임스탬프 오프셋(sec), 필요 시 미래/과거 보정
-    predict_to_current_time: false # 현재 시각까지 추가 예측 비활성(오버슈트/앞서감 방지)
+    predict_to_current_time: true # 현재 시각까지 IMU(vyaw) 추가 적분 - deskewing/RTAB-Map TF 조회 시 stale pose 방지
 
     # Wheel odometry 입력
     odom0: /odom # 바퀴 오도메트리 토픽

@@ -1,4 +1,4 @@
-# ca_ws 실행/튜닝 가이드 (2026-02-27 업데이트)
+# ca_ws 실행/튜닝 가이드 (2026-02-28 업데이트)
 
 이 문서는 오늘 반영된 변경사항 기준으로 정리합니다.
 
@@ -14,6 +14,7 @@
 - PID CSV 시각화
 - RealSense IMU(HID/IIO) 커널 모듈 빌드/설치
 - 맵 뒤틀림(회전 드리프트) 이슈 대응 기록
+- **제자리 회전 시 로컬/글로벌 맵 불일치 해결 (2026-02-28 신규)**
 
 ## 1) 빌드
 
@@ -357,13 +358,15 @@ IMU/센서 프레임:
 RTAB-Map 파라미터(드리프트 완화용):
 - `RGBD/ProximityBySpace=true`
 - `RGBD/ProximityMaxGraphDepth=15`
-- `RGBD/LinearUpdate=0.15`
-- `RGBD/AngularUpdate=0.20`
-- `Rtabmap/DetectionRate=3.0`
+- `RGBD/LinearUpdate=0.10` _(0.15에서 변경, 2026-02-28)_
+- `RGBD/AngularUpdate=0.05` _(0.20에서 변경, 2026-02-28)_
+- `Rtabmap/DetectionRate=5.0` _(3.0에서 변경, 2026-02-28)_
 - `Rtabmap/LoopThr=0.30`
 - `RGBD/OptimizeMaxError=0.3`
 - `Reg/Force3DoF=true`
 - `Optimizer/Strategy=1` 설정
+- `Icp/PointToPlane=true` _(신규 추가, 2026-02-28)_
+- `Icp/PointToPlaneK=8` _(신규 추가, 2026-02-28)_
 
 ### 11-2) 추가 진단 스크립트
 
@@ -388,7 +391,7 @@ python3 ~/ca_ws/tools/ekf_yaw_probe.py --duration 180 --rate 20
 1. g2o 설치 후 RTAB-Map 재빌드로 `Strategy=1` 실제 적용 확인
 2. 맵 안정화 1차 검증은 LiDAR-only (`rgbd_sync:=false`, `subscribe_rgbd:=false`)로 A/B 테스트
 3. RGBD 재투입 전, out-of-order 경고와 센서 타임스탬프 정합 재확인
-4. deskew 고정 프레임은 `base_link`/`odom`을 각각 짧게 A/B 테스트하여 실제 왜곡이 적은 쪽 채택
+4. ~~deskew 고정 프레임 A/B 테스트~~ → **`base_link`로 확정 적용 (2026-02-28)**
 
 g2o 소스 빌드/재빌드 예시:
 ```bash
@@ -419,4 +422,64 @@ colcon build --symlink-install \
     -DWITH_G2O=ON \
     -DG2O_DIR=/usr/local/lib/cmake/g2o
 source ~/ca_ws/install/setup.bash
+```
+
+## 12) 제자리 회전 시 로컬/글로벌 맵 불일치 해결 (2026-02-28)
+
+### 증상
+
+자율주행 중 제자리 회전(in-place rotation) 이후 로컬 맵이 누적 글로벌 맵과 어긋남.
+
+### 원인 분석 (3가지 중첩)
+
+**원인 1 — `RGBD/AngularUpdate=0.20` (11.5°) 너무 큼 (주원인)**
+- 11.5°마다 맵 노드 1개 생성 → 큰 각도 변화를 ICP 1번으로 매칭해야 함
+- 순수 회전 상황에서 ICP가 로컬 미니멈에 빠져 정합 실패
+
+**원인 2 — SLAM 등록용 ICP에 PointToPlane 없음**
+- `odom_args`(ICP 오도메트리)에는 설정되어 있었으나, SLAM 노드 등록(`Reg/Strategy=2`)용 ICP에는 누락
+- Point-to-Point ICP는 순수 회전에서 수렴 불안정
+
+**원인 3 — EKF 갱신 주기가 낮아 deskewing 오차 발생**
+- `frequency=20Hz` → TF가 50ms 단위로 갱신
+- Deskewing 노드가 각 LiDAR 포인트 타임스탬프로 TF 조회 시 보간 정밀도 부족
+- `predict_to_current_time=false` → RTAB-Map이 TF 조회할 때 stale pose 반환
+
+### 적용된 수정
+
+**`src/rtabmap_ros/rtabmap_launch/launch/rtabmap.launch.py`**
+
+| 파라미터 | 변경 전 | 변경 후 |
+|----------|---------|---------|
+| `RGBD/AngularUpdate` | `0.20` | `0.05` |
+| `RGBD/LinearUpdate` | `0.15` | `0.10` |
+| `Rtabmap/DetectionRate` | `3.0` | `5.0` |
+| `Icp/PointToPlane` | 없음 | `true` |
+| `Icp/PointToPlaneK` | 없음 | `8` |
+
+**`src/rtabmap_ros/rtabmap_launch/launch/sensor_sync.launch.py`**
+
+| 항목 | 변경 전 | 변경 후 |
+|------|---------|---------|
+| Deskewing `fixed_frame_id` | `odom` | `base_link` |
+
+> 주석엔 "base_link 사용"이라 적혀있었으나 코드는 `odom`으로 방치된 버그 수정.
+> 제자리 회전 중 EKF yaw 오차가 deskewing에 전파되던 문제 차단.
+
+**`src/robot_localization/params/ekf.yaml`**
+
+| 파라미터 | 변경 전 | 변경 후 |
+|----------|---------|---------|
+| `frequency` | `20.0` | `50.0` |
+| `predict_to_current_time` | `false` | `true` |
+
+> `frequency` 50Hz: TF 보간 정밀도 50ms → 20ms. deskewing 품질 향상.
+> `predict_to_current_time true`: RTAB-Map/deskewing TF 조회 시 IMU를 현재 시점까지 추가 적분해서 최신 pose 반환.
+
+### 재실행 방법
+
+재빌드 불필요 (파라미터/런치 파일만 변경).
+
+```bash
+bash ~/ca_ws/run_all.sh
 ```

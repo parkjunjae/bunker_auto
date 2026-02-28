@@ -105,7 +105,7 @@ def generate_launch_description():
         name='lidar_deskewing',
         output='screen',
         parameters=[{
-            'fixed_frame_id': 'odom',  # odom 대신 base_link 사용
+            'fixed_frame_id': 'base_link',  # 제자리 회전 시 odom 드리프트가 deskew에 전파되는 것 방지
             'queue_size': 3,
             'qos': 2,
             'wait_for_transform': 0.05,  # 0.5 → 0.2 (더 엄격)
