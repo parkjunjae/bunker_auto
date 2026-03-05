@@ -248,6 +248,27 @@ class BunkerMessenger {
     odom_msg.twist.twist.linear.y = 0.0;
     odom_msg.twist.twist.angular.z = angular_speed;
 
+    // EKF에서 휠 오돔을 과신하지 않도록 기본 공분산을 명시한다.
+    // 이 프로젝트에서는 odom0_config로 vx, vyaw만 사용하므로 twist 공분산이 핵심이다.
+    odom_msg.pose.covariance.fill(0.0);
+    odom_msg.twist.covariance.fill(0.0);
+
+    // pose는 EKF에서 사용하지 않지만, 0(과신) 상태를 피하기 위해 큰 분산 부여
+    odom_msg.pose.covariance[0] = 1e3;   // x
+    odom_msg.pose.covariance[7] = 1e3;   // y
+    odom_msg.pose.covariance[14] = 1e6;  // z
+    odom_msg.pose.covariance[21] = 1e6;  // roll
+    odom_msg.pose.covariance[28] = 1e6;  // pitch
+    odom_msg.pose.covariance[35] = 1e3;  // yaw
+
+    // twist 공분산: vx는 비교적 신뢰, vyaw는 슬립 영향 고려해 보수적으로
+    odom_msg.twist.covariance[0] = 0.02;   // vx
+    odom_msg.twist.covariance[7] = 1e6;    // vy (unused)
+    odom_msg.twist.covariance[14] = 1e6;   // vz (unused)
+    odom_msg.twist.covariance[21] = 1e6;   // vroll (unused)
+    odom_msg.twist.covariance[28] = 1e6;   // vpitch (unused)
+    odom_msg.twist.covariance[35] = 0.02;   // vyaw
+
     odom_pub_->publish(odom_msg);
   }
 };

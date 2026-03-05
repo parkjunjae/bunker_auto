@@ -71,11 +71,13 @@ def generate_launch_description():
             'output_topic': '/camera/camera/imu_bias_corrected',
             'target_frame': 'base_link',  # 프레임 변환 안 함
             'tf_timeout_sec': 0.05,
-            'calib_samples': 1000,
-            'stationary_threshold': 0.01,
-            'gyro_cov': 0.01,   # 공분산 낮춤 (더 신뢰)
+            'calib_samples': 1000,  # 실제 IMU ~50Hz × 20초 = 충분한 평균으로 bias 정확도 향상
+            'stationary_threshold': 0.003,  # 더 엄격한 정지 판단 (미세 진동 포함 상태 제외)
+            'gyro_cov': 0.01,  # 휠 vyaw(0.02)보다 낮게: IMU가 주도 → 제자리 회전 시 슬립 보정 효과
             'accel_cov': 0.01,
-            'publish_during_calib': True,
+            'publish_during_calib': False,
+            'continuous_calib': True,   # 초기 교정 후 정지 상태에서 EMA로 bias 지속 추적
+            'ema_alpha': 0.001,         # 50Hz × 1000 스텝 ≈ 20초 시정수 (온도 드리프트 추적)
         }],
     )
 
@@ -90,6 +92,7 @@ def generate_launch_description():
             'publish_tf': False,
             'world_frame': 'enu',
             'gain': 0.1,  # 낮을수록 안정적, 높을수록 반응 빠름
+            'zeta': 0.0,  # gyro drift correction 비활성화 → angular_velocity 값 변조 방지
         }],
         remappings=[
             ('imu/data_raw', '/camera/camera/imu_bias_corrected'),
@@ -105,10 +108,10 @@ def generate_launch_description():
         name='lidar_deskewing',
         output='screen',
         parameters=[{
-            'fixed_frame_id': 'base_link',  # 제자리 회전 시 odom 드리프트가 deskew에 전파되는 것 방지
+            'fixed_frame_id': 'base_link',  # 로컬 움직임 기준 deskew → odom 드리프트 영향 차단
             'queue_size': 3,
             'qos': 2,
-            'wait_for_transform': 0.05,  # 0.5 → 0.2 (더 엄격)
+            'wait_for_transform': 0.5,  # TF 준비 전 skewed cloud 통과 방지
             'slerp': True,
             'use_sim_time': use_sim_time,
         }],

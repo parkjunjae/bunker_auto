@@ -51,7 +51,8 @@ def generate_launch_description():
             'map_frame_id': 'map',
             'publish_tf_map': 'true',
             'visual_odometry': 'false',
-            'icp_odometry': 'false',
+            'icp_odometry': 'true',   # LiDAR ICP odometry 활성화 → 휠 슬립/IMU bias 우회
+            'odom_args': '--Icp/VoxelSize 0.10 --Icp/PointToPlane 0 --Icp/MaxCorrespondenceDistance 0.5 --Icp/MaxTranslation 2.0 --Icp/MaxRotation 6.28 --Icp/CorrespondenceRatio 0.01 --Icp/OutlierRatio 0.7 --Icp/MaxIterations 50 --Icp/Epsilon 0.001 --Odom/GuessMotion true --Odom/ResetCountdown 5 --Reg/Force3DoF true',
             'log_level': 'error',  
             'odom_log_level': 'error',  # Odometry 로그도 error 레벨로
             'qos': '2',  # BEST_EFFORT QoS for Nav2 compatibility
@@ -60,7 +61,7 @@ def generate_launch_description():
             'sync_queue_size': '10',   # Approx sync queue size
             # Let RTAB-Map sync RGB + Depth directly (more reliable than /camera/camera/rgbd)
             'approx_rgbd_sync': 'true',
-            'approx_sync_max_interval': '0.08',
+            'approx_sync_max_interval': '0.05',
             'rgbd_sync': 'true',
             'subscribe_rgbd': 'false',
             'rgb_topic': '/camera/camera/color/image_raw',
@@ -69,8 +70,14 @@ def generate_launch_description():
             'rtabmap_args': rtabmap_args,  # Prefer ROS params in rtabmap.launch.py
             'database_path': database_path,
             'delete_db_on_start': delete_db_on_start,  # DB reset via ROS param
-            # RTAB-Map에는 동적 필터 전 단계인 filtered만 입력 (정적맵 품질 유지)
-            'scan_cloud_topic': livox_filtered_topic,
+            # RTAB-Map(그래프/맵)에는 dynamic_filter 결과를 사용 (이동 물체 제거)
+            'scan_cloud_topic': dynamic_filter_output,
+            # icp_odometry에는 원본 deskewed 스캔 직접 사용
+            # (dynamic_filter는 odom TF 필요 → EKF 필요 → icp_odom 필요 → 데드락)
+            'icp_odom_scan_topic': livox_deskewed_topic,
+            # guess_frame_id를 비워 guess_from_tf 비활성화
+            # (odom TF가 없는 초기 상태에서 ICP 업데이트 abort 방지)
+            'odom_guess_frame_id': '',
         }.items()
     )
     livox_filter_node = Node(
@@ -82,8 +89,8 @@ def generate_launch_description():
             'input_topic': livox_deskewed_topic,      # 입력 포인트클라우드(데스큐 완료)
             'output_topic': livox_filtered_topic,     # 필터링 후 출력 토픽
             'leaf_size': 0.05,                       # VoxelGrid 다운샘플 크기(해상도)
-            'ror_radius': 0.15,                      # ROR 반경(이웃 탐색 거리)
-            'ror_min_neighbors': 2,                  # ROR 이웃 최소 개수
+            'ror_radius': 0.20,                      # ROR 반경: 너무 크면 sparse 클라우드 통째로 제거 → loop closure 불가
+            'ror_min_neighbors': 2,                  # ROR 이웃 최소: 낮춰서 loop closure용 포인트 보존
             'use_voxel': True,                       # VoxelGrid 다운샘플 사용 여부
             'use_ror': True,                         # ROR 노이즈 제거 사용 여부
         }],

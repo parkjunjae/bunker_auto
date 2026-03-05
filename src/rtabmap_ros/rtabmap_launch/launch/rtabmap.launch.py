@@ -277,8 +277,12 @@ def launch_setup(context, *args, **kwargs):
                 "always_process_most_recent_frame": LaunchConfiguration('odom_always_process_most_recent_frame')}],
             remappings=[
                 ("scan", "/scan_dummy"),
-                ("scan_cloud", LaunchConfiguration('scan_cloud_topic')),
-                ("odom", LaunchConfiguration('odom_topic')),
+                # icp_odometry는 dynamic_filter(odom TF 필요) 이전 원본 스캔을 사용
+                # → dynamic_filter 데드락(icp_odom 없음→EKF 없음→odom TF 없음→dynamic_filter 없음) 방지
+                ("scan_cloud", LaunchConfiguration('icp_odom_scan_topic')),
+                # icp_odometry output(odom 토픽)을 /icp_odom으로 publish
+                # odom_guess_frame_id='' 이므로 odom 구독은 guess에 사용되지 않음
+                ("odom", "/icp_odom"),
                 ("imu", LaunchConfiguration('imu_topic'))],
             arguments=[LaunchConfiguration("args"), LaunchConfiguration("odom_args"), "--ros-args", "--log-level", [LaunchConfiguration('namespace'), '.icp_odometry:=', LaunchConfiguration('odom_log_level')], "--log-level", ['icp_odometry:=', LaunchConfiguration('odom_log_level')]],
             prefix=LaunchConfiguration('launch_prefix'),
@@ -315,9 +319,9 @@ def launch_setup(context, *args, **kwargs):
                 "config_path": LaunchConfiguration('cfg').perform(context),
                 # 3D 포인트를 누적해서 2D grid로 만드는 구조
                 "Grid/3D": "true", # 3D 그리드 맵 생성 활성화
-                "Grid/RangeMax": "7.0",  # 최대 감지 거리 (8m)
+                "Grid/RangeMax": "6.0",  # 원거리 노이즈 누적 억제
                 "Grid/RangeMin": "0.1",  # 로봇 근처 장애물(25cm 등) 인식 보강
-                "Grid/CellSize": "0.07", # 2D 그리드 맵의 셀(격자) 크기
+                "Grid/CellSize": "0.05", # 점유맵 경계 번짐 완화
                 #---------------------------------------------------------
                 "Grid/Sensor": "0", # 0: Laser(라이다)만, 1: Depth만, 2: 둘 다 (타임싱크 문제로 0 권장)
                 "Grid/FromDepth": "false", # Depth 맵 생성 비활성화 (occupancy grid용)
@@ -325,14 +329,14 @@ def launch_setup(context, *args, **kwargs):
                 "Grid/MinObstacleHeight": "0.10",  # 바닥 노이즈 억제용 최소 장애물 높이(소파는 0.83m라 영향 없음)
                 "Grid/MaxObstacleHeight": "2.0",  # 최대 장애물 높이 (2m)
                 # MaxGroundHeight=0이면 RTAB-Map이 자동으로 CellSize로 대체하며 경고를 출력한다.
-                "Grid/MaxGroundHeight": "0.05",  # 바닥으로 간주할 최대 높이(바닥 밴드 확장으로 링/잔상 억제)
+                "Grid/MaxGroundHeight": "0.03",  # 바닥 밴드 축소로 벽 경계 번짐 억제
                 "Grid/MinGroundHeight": "-0.05",  # 최소 바닥 높이(바닥 밴드 확장)
                 #---------------------------------------------------------
                 # 프레임마다 조금씩 다른 위치에 와도 같은 덩어리로 묶을 수 있게 도와줌 
                 "Grid/NormalsSegmentation": "false",  # 법선 기반 비활성화 (희소 라이다에 더 안정적)
                 "Grid/NoiseFilteringRadius": "0.1",  # 노이즈 필터 반경(너무 크면 포인트가 비어짐)
-                "Grid/NoiseFilteringMinNeighbors": "5",  # 이웃 수 상향(산발적 점/잔상 감소)
-                "Grid/ClusterRadius": "0.2", # 클러스터링 반경(너무 작으면 같은 물체가 분리됨)
+                "Grid/NoiseFilteringMinNeighbors": "8",  # 산발 점 제거 강화
+                "Grid/ClusterRadius": "0.12", # 과도한 클러스터 팽창 억제
                 #---------------------------------------------------------
                 "Grid/FlatObstacleDetected": "true", # 평평한 장애물도 감지 (테이블 등)
                 "Grid/RayTracing": "true", # Raytrace 활성화 (빈 공간 명시적 삭제)
@@ -358,10 +362,10 @@ def launch_setup(context, *args, **kwargs):
                 "RGBD/ProximityBySpace": "true",
                 "RGBD/ProximityMaxGraphDepth": "15",     # 전체 그래프까지 근접 탐색
                 "RGBD/ProximityPathMaxNeighbors": "1",  # 근접 링크를 늘려 경로 정합 보강
-                # 제자리 회전 시 ICP 수렴 안정을 위해 노드 생성 간격 축소
-                # AngularUpdate 0.20(11.5°) → 0.05(2.9°): 각 단계가 작아야 ICP가 수렴
+                # 노드 생성 간격: 너무 촘촘하면(0.05°) odom 오차가 누적됨
+                # 0.15rad(8.6°) 단위로 노드 생성 → ICP 수렴 안정성 확보
                 "RGBD/LinearUpdate": "0.10",
-                "RGBD/AngularUpdate": "0.05",
+                "RGBD/AngularUpdate": "0.15",
                 # 처리 주기(Hz) - 회전 보정 반응속도 향상
                 "Rtabmap/DetectionRate": "5.0",
                 #---------------------------------------------------------
@@ -372,12 +376,12 @@ def launch_setup(context, *args, **kwargs):
                 # SLAM 등록용 ICP: PointToPlane 활성화 (순수 회전에서 수렴 안정)
                 "Icp/PointToPlane": "true",
                 "Icp/PointToPlaneK": "8",
-                "RGBD/OptimizeMaxError": "0.3",        # (예시) 최적화 허용 오차 제한
+                "RGBD/OptimizeMaxError": "0.5",        # (예시) 최적화 허용 오차 제한
                 "Rtabmap/LoopThr": "0.30",             # 루프 성립 임계(너무 높으면 루프가 안 잡힘)
                 "Vis/MinInliers": "30",                # 시각 매칭 최소 인라이어 수(루프 안정성)
                 #--------------------------------------------------------
-                # Keep local area stable by optimizing from the latest pose.
-                "RGBD/OptimizeFromGraphEnd": "true",
+                # origin 기준 최적화: loop closure 시 맵이 아닌 로봇 위치가 보정됨 → 맵 뒤틀림 방지
+                "RGBD/OptimizeFromGraphEnd": "false",
                 "topic_queue_size": LaunchConfiguration('topic_queue_size'),
                 "sync_queue_size": LaunchConfiguration('sync_queue_size'),
                 "qos_image": LaunchConfiguration('qos_image'),
@@ -570,7 +574,8 @@ def generate_launch_description():
         DeclareLaunchArgument('subscribe_scan',       default_value='false',       description=''),
         DeclareLaunchArgument('scan_topic',           default_value='/scan',       description=''),
         DeclareLaunchArgument('subscribe_scan_cloud', default_value='true',       description=''),
-        DeclareLaunchArgument('scan_cloud_topic',     default_value='/livox/lidar/synced/deskewed', description=''),
+        DeclareLaunchArgument('scan_cloud_topic',     default_value='/livox/lidar/static_filtered', description=''),
+        DeclareLaunchArgument('icp_odom_scan_topic',  default_value='/livox/lidar/synced/deskewed', description='Scan topic for icp_odometry only (separate from rtabmap scan_cloud_topic to avoid TF deadlock).'),
         DeclareLaunchArgument('scan_normal_k',        default_value='0',           description=''),
         
         # Odometry
@@ -581,7 +586,7 @@ def generate_launch_description():
         DeclareLaunchArgument('publish_tf_odom',            default_value='false',  description=''),
         DeclareLaunchArgument('odom_tf_angular_variance',   default_value='0.01',    description='If TF is used to get odometry, this is the default angular variance'),
         DeclareLaunchArgument('odom_tf_linear_variance',    default_value='0.001',   description='If TF is used to get odometry, this is the default linear variance'),
-        DeclareLaunchArgument('odom_args',                  default_value='--Icp/VoxelSize 0.15 --Icp/PointToPlaneRadius 0 --Icp/PointToPlaneK 8 --Icp/MaxTranslation 2 --Icp/MaxCorrespondenceDistance 0.2 --Icp/Strategy 1 --Icp/OutlierRatio 0.7 --Icp/MaxIterations 20 --Icp/Epsilon 0.001',      description='More arguments for odometry (overwrite same parameters in rtabmap_args).'),
+        DeclareLaunchArgument('odom_args',                  default_value='--Icp/VoxelSize 0.15 --Icp/PointToPlaneRadius 0 --Icp/PointToPlaneK 8 --Icp/PointToPlane 1 --Icp/MaxTranslation 2 --Icp/MaxCorrespondenceDistance 0.3 --Icp/Strategy 1 --Icp/OutlierRatio 0.7 --Icp/MaxIterations 30 --Icp/Epsilon 0.001',      description='More arguments for odometry (overwrite same parameters in rtabmap_args).'),
         DeclareLaunchArgument('odom_sensor_sync',           default_value='true', description=''),
         DeclareLaunchArgument('odom_guess_frame_id',        default_value='odom',      description=''),
         DeclareLaunchArgument('odom_guess_min_translation', default_value='0.0',   description=''),

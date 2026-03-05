@@ -4,7 +4,7 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odometry/filtered # EKF 융합된 오도메트리 사용
-    bt_loop_duration: 10
+    bt_loop_duration: 30
     default_server_timeout: 20
     enable_groot_monitoring: True
     groot_zmq_publisher_port: 1666
@@ -136,12 +136,12 @@ controller_server:
       treat_unknown_as_obstacle: false
       # PID로 목표 속도를 추종하도록 보정 (저수준 제어 안정화) 안정화용 PID
       use_pid: true
-      pid_kp_lin: 1.2 # 선속도 비례 이득(실차 저오차 구간 중앙값 기반)
-      pid_ki_lin: 0.0 # 선속도 적분 이득(누적 오차 보정, 기본은 끔)
-      pid_kd_lin: 0.03 # 선속도 미분 이득(오버슈트 완화)
-      pid_kp_ang: 1.23 # 각속도 비례 이득(회전 오차에 즉시 반응)
-      pid_ki_ang: 0.0 # 각속도 적분 이득(누적 오차 보정, 기본은 끔)
-      pid_kd_ang: 0.10 # 각속도 미분 이득(회전 오버슈트 완화)
+      pid_kp_lin: 0.7 # kp 낮춤 (1.2→0.7): oscillation 억제
+      pid_ki_lin: 0.0
+      pid_kd_lin: 0.06 # kd 높임 (0.03→0.06): 댐핑 강화로 떨림 감소
+      pid_kp_ang: 0.8 # kp 낮춤 (1.23→0.8): 각속도 oscillation 억제
+      pid_ki_ang: 0.0
+      pid_kd_ang: 0.15 # kd 높임 (0.10→0.15): 회전 떨림 감소
       pid_i_max_lin: 0.5 # 선속도 적분 항 최대치(윈드업 방지)
       pid_i_max_ang: 1.0 # 각속도 적분 항 최대치(윈드업 방지)
       pid_dt_max: 0.5 # PID 시간 간격 상한(너무 큰 dt면 적분 초기화)
@@ -229,11 +229,11 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      footprint: "[[0.5115, 0.389], [0.5115, -0.389], [-0.5115, -0.389], [-0.5115, 0.389]]"
-      footprint_padding: 0.04
+      footprint: "[[0.62, 0.389], [0.62, -0.389], [-0.62, -0.389], [-0.62, 0.389]]"
+      footprint_padding: 0.0
       update_frequency: 20.0
       publish_frequency: 10.0
-      transform_tolerance: 0.3 # 0.2 → 0.3초로 완화(캐시 미스 감소)
+      transform_tolerance: 0.1
       plugins: ["obstacle_layer", "inflation_layer"]
 
       obstacle_layer:
@@ -255,15 +255,16 @@ local_costmap:
           obstacle_range: 3.0
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
-          observation_persistence: 0.1 # 1~2초 권장
+          observation_persistence: 0.25 # filtered delay max 138ms + 여유 2주기(100ms) = 238ms → 0.25s
           expected_update_rate: 0.0 # 드롭 무시
 
         lidar_clear:
-          topic: /livox/lidar/synced/deskewed
+          topic: /livox/lidar/filtered
           data_type: PointCloud2
+          sensor_frame: livox_frame
           marking: false
           clearing: true
-          raytrace_range: 4.5 # 너무 길면 쉽게 지워짐
+          raytrace_range: 4.5
           expected_update_rate: 0.0
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
@@ -272,12 +273,13 @@ local_costmap:
           # RealSense pointcloud 토픽(환경에 맞게 수정)
           topic: /camera/camera/depth/color/points
           data_type: PointCloud2
+          sensor_frame: camera_link # TF 변환 기준 프레임 명시 (회전 시 오차 방지)
           marking: true
           clearing: false
           obstacle_range: 1.5 # 근거리 보강용
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
-          observation_persistence: 0.0 # 0.2~0.5 권장
+          observation_persistence: 0.2 # 카메라 30Hz 기준 6주기 유지
           expected_update_rate: 0.0
 
       # voxel_layer:  # 필요 시 다시 사용 (3D voxel)
@@ -311,6 +313,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
+        # 로봇 반폭 0.389m + 안전마진 0.10m = 0.49m → 0.45m
         cost_scaling_factor: 4.0
         inflation_radius: 0.07
         footprint_clearing_enabled: true
@@ -327,21 +330,24 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       rolling_window: false
-      resolution: 0.03
+      # RTAB-Map Grid/CellSize(0.05)와 맞춰 리샘플링 번짐을 줄인다.
+      resolution: 0.05
       # 전역 코스트맵을 로컬처럼 보이지 않게 충분히 크게 고정
       width: 80
       height: 80
       origin_x: -40.0
       origin_y: -40.0
-      footprint: "[[0.5115, 0.389], [0.5115, -0.389], [-0.5115, -0.389], [-0.5115, 0.389]]"
-      footprint_padding: 0.03
+      footprint: "[[0.62, 0.389], [0.62, -0.389], [-0.62, -0.389], [-0.62, 0.389]]"
+      footprint_padding: 0.0
       update_frequency: 10.0 # 5.0 → 10.0Hz로 증가 (더 빠른 맵 업데이트)
       publish_frequency: 5.0 # 2.0 → 5.0Hz로 증가
       transform_tolerance: 0.3 # 1.0 → 0.2초로 변경
       track_unknown_space: true
 
-      # 레이어 구성: 정적맵 + 시간 제한 누적 장애물 + 안전거리
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # 레이어 구성: 정적맵 + 안전거리
+      # 번짐 억제를 위해 전역 obstacle_layer는 비활성화하고,
+      # 장애물 반영은 static_layer(/rtabmap/map) + local obstacle_layer에서 처리한다.
+      plugins: ["static_layer","obstacle_layer" ,"inflation_layer"]
 
       # ========================================================================
       # 1. 정적 맵 레이어: 벽, 기둥 등 고정 구조물 (RTABMap SLAM 맵)
@@ -367,15 +373,15 @@ global_costmap:
         observation_sources: lidar_mark
 
         lidar_mark:
-          topic: /livox/lidar/static_filtered
+          topic: /livox/lidar/filtered
           data_type: PointCloud2
           marking: true
           clearing: false
           obstacle_range: 4.0
           min_obstacle_height: 0.05
           max_obstacle_height: 1.8
-          # 정적은 static_layer에 남기고, 동적 잔상은 오래 끌지 않도록 0으로 유지
-          observation_persistence: 0.5
+          # filtered delay max 138ms + 여유 2주기(100ms) = 238ms → 0.25s
+          observation_persistence: 0.25
           expected_update_rate: 0.0
 
       # ========================================================================
@@ -385,7 +391,6 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
         footprint_clearing_enabled: true
-        # 낮출수록 비용 영향 범위가 멀리 퍼져 중앙 유도 효과가 커짐.
         cost_scaling_factor: 1.5
         inflation_radius: 0.07
 

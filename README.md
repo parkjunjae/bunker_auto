@@ -1,6 +1,6 @@
-# ca_ws 실행/튜닝 가이드 (2026-02-28 업데이트)
+# ca_ws 실행/튜닝 가이드 (2026-03-05 업데이트)
 
-이 문서는 오늘 반영된 변경사항 기준으로 정리합니다.
+이 문서는 반영된 변경사항 기준으로 정리합니다.
 
 - 전체 실행(run_all)
 - EC25 GPS -> /gps/fix 브리지
@@ -14,7 +14,8 @@
 - PID CSV 시각화
 - RealSense IMU(HID/IIO) 커널 모듈 빌드/설치
 - 맵 뒤틀림(회전 드리프트) 이슈 대응 기록
-- **제자리 회전 시 로컬/글로벌 맵 불일치 해결 (2026-02-28 신규)**
+- 제자리 회전 시 로컬/글로벌 맵 불일치 해결 (2026-02-28)
+- **IMU 바이어스 보정 개선 / ICP odometry 활성화 / 맵 뒤틀림 근본 해결 (2026-03-05 신규)**
 
 ## 1) 빌드
 
@@ -483,3 +484,135 @@ source ~/ca_ws/install/setup.bash
 ```bash
 bash ~/ca_ws/run_all.sh
 ```
+
+---
+
+## 13) IMU 바이어스 보정 개선 / ICP Odometry 활성화 (2026-03-05)
+
+### 13-1) IMU 양자화 문제 발견 및 결론
+
+RealSense D455와 Livox MID360 IMU 모두 각속도 LSB = **~0.00107 rad/s** 로 동일한 양자화 한계가 있습니다.
+
+- 정지 중에도 IMU z값이 이산적 값(0, ±0.00107, ±0.00214 ...)만 출력
+- EKF `vyaw` 입력으로 사용하면 양자화 스텝이 적분되어 드리프트 발생
+- **결론: IMU vyaw는 EKF에서 비활성화 (`imu0_config vyaw=false`)**
+
+### 13-2) IMU Bias Corrector EMA 지속 재교정 추가
+
+**`src/camera_imu_pipeline_cpp/src/camera_imu_bias_corrector.cpp`**
+
+초기 1000샘플 평균 교정 완료 후, 정지 상태에서 EMA로 bias를 지속 추적합니다.
+
+```cpp
+// 파라미터 추가
+continuous_calib: true   // 정지 중 EMA로 bias 지속 업데이트
+ema_alpha: 0.001         // 시정수 ≈ 20초 (50Hz × 1000 스텝)
+
+// EMA 업데이트 (정지 감지 후)
+bias = (1 - alpha) * bias + alpha * current
+```
+
+**`src/rtabmap_ros/rtabmap_launch/launch/sensor_sync.launch.py`**
+- `publish_during_calib: False` — 교정 완료 전 메시지 미발행
+- `continuous_calib: True`
+- `ema_alpha: 0.001`
+
+### 13-3) ROR 필터 완화 (Loop Closure 복구)
+
+**`src/rtabmap_ros/rtabmap_launch/launch/rtabmap_nav2.launch.py`**
+
+| 파라미터 | 변경 전 | 변경 후 |
+|----------|---------|---------|
+| `ror_radius` | `0.25` | `0.20` |
+| `ror_min_neighbors` | `4` | `2` |
+
+원인: radius=0.25, neighbors=4 설정이 sparse한 포인트클라우드(10~60개)를 통째로 제거해 RTAB-Map loop closure 불가 → 맵 뒤틀림 발생.
+
+### 13-4) RGBD/OptimizeFromGraphEnd 변경
+
+**`src/rtabmap_ros/rtabmap_launch/launch/rtabmap.launch.py`**
+
+```
+RGBD/OptimizeFromGraphEnd: true → false
+```
+
+- `true`: loop closure 시 현재 위치 고정, 맵이 뒤틀림
+- `false`: origin 기준 최적화, loop closure 시 로봇 위치가 보정됨 (맵 안정)
+
+### 13-5) ICP Odometry 활성화 (yaw 드리프트 근본 해결)
+
+IMU 양자화로 yaw를 신뢰할 수 없어 **LiDAR 스캔 매칭(ICP)으로 yaw를 직접 계산**합니다.
+휠 슬립, IMU bias/양자화 모두 우회합니다.
+
+#### 아키텍처 변경
+
+```
+이전:  /odom(휠) + IMU → EKF → /odometry/filtered
+이후:  /odom(휠) + /icp_odom(LiDAR vyaw) → EKF → /odometry/filtered
+```
+
+#### EKF 설정 (`src/robot_localization/params/ekf.yaml`)
+
+```yaml
+# ICP odometry 입력 추가
+odom1: /icp_odom
+odom1_config: [false, false, false, false, false, false,
+               false, false, false, false, false,
+               true,   # vyaw ← LiDAR ICP 기반, 슬립/bias 없음
+               false, false, false]
+
+# IMU vyaw 비활성화 (양자화 노이즈로 드리프트 불가피)
+imu0_config: [false×11, false, false, false, false]  # vyaw=false
+```
+
+#### ICP Odometry 파라미터 (`rtabmap_nav2.launch.py`)
+
+```
+--Reg/Force3DoF true           # 평면 3자유도 제한 (z 발산 방지)
+--Icp/VoxelSize 0.10
+--Icp/PointToPlane 0
+--Icp/MaxCorrespondenceDistance 0.5
+--Icp/MaxTranslation 2.0       # 기본값 0.2m → 초기 수렴 허용
+--Icp/MaxRotation 6.28         # 기본값 0.78rad → 제한 완화
+--Icp/CorrespondenceRatio 0.01 # 실내 sparse 환경 대응
+--Odom/GuessMotion true
+--Odom/ResetCountdown 5        # 5프레임 연속 실패 시 리셋
+```
+
+#### 데드락 해결 (`rtabmap.launch.py`, `rtabmap_nav2.launch.py`)
+
+```
+문제:
+  icp_odometry → /livox/lidar/static_filtered 필요
+  dynamic_filter → odom TF 필요 → EKF 필요 → /icp_odom 필요 → 데드락
+
+해결:
+  icp_odometry → /livox/lidar/synced/deskewed (원본, TF 불필요)
+  rtabmap     → /livox/lidar/static_filtered  (dynamic filter 결과)
+```
+
+관련 파라미터:
+- `icp_odom_scan_topic: /livox/lidar/synced/deskewed`
+- `odom_guess_frame_id: ''` — guess_from_tf 비활성화
+- `odom` remapping → `/icp_odom` — icp_odometry가 `/icp_odom`으로 직접 발행
+
+#### 실행 순서 변경 (`run_all.sh`)
+
+```
+변경 전: rtabmap_nav2 → wait /icp_odom → EKF
+변경 후: EKF → wait odom→base_link TF → rtabmap_nav2 → wait /icp_odom
+```
+
+EKF를 먼저 실행해 `odom→base_link` TF를 만들어야 icp_odometry가 정상 동작합니다.
+
+### 13-6) 트러블슈팅 기록 (ICP odometry 디버깅 과정)
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| Publisher count=0 | `odom` remapping이 `/odometry/filtered`로 되어 있어 `/icp_odom`으로 미발행 | `("odom", "/icp_odom")`으로 수정 |
+| `ICP correction too large` (limits=0.2m) | `Icp/MaxTranslation` 기본값 0.2m | `--Icp/MaxTranslation 2.0` 추가 |
+| `guess_from_tf abort` | `odom_guess_frame_id='odom'` 기본값 → odom TF 없어 abort | `odom_guess_frame_id: ''` 설정 |
+| `null guess` error | `Odom/GuessMotion false` → 2프레임 이후 guess=null | `Odom/GuessMotion true`로 복원 |
+| z/roll/pitch 발산 | 3D ICP가 평면 로봇에 6자유도 최적화 → z 발산 누적 | `--Reg/Force3DoF true` 추가 |
+| corrRatio 미달 | `Icp/CorrespondenceRatio 0.1` 기본값이 실내 sparse 환경에 과도 | `--Icp/CorrespondenceRatio 0.01` |
+| `Icp/Strategy 1` 미지원 | libpointmatcher 없이 빌드됨 | Strategy 0(기본 PCL ICP)으로 변경 |

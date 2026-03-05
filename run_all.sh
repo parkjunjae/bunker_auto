@@ -26,34 +26,40 @@ run_cmd() {
 
 run_ros() {
   local name="$1"; shift
-  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=30 && $*"
+  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=20 && $*"
 }
 
 run_ros_with_nav2_env() {
   local name="$1"; shift
-  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && source ${ROOT}/install/rl_local_controller/share/rl_local_controller/local_setup.bash && source ${ROOT}/install/temp_goal_bt/share/temp_goal_bt/local_setup.bash && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=30 && $*"
+  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && source ${ROOT}/install/rl_local_controller/share/rl_local_controller/local_setup.bash && source ${ROOT}/install/temp_goal_bt/share/temp_goal_bt/local_setup.bash && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=20 && $*"
 }
 
 run_realsense() {
   local name="$1"; shift
-  run_cmd "$name" bash -lc "source ${ROOT}/install/setup.bash && export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH && export PATH=/usr/local/bin:\$PATH && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=30 && $*"
+  run_cmd "$name" bash -lc "source ${ROOT}/install/setup.bash && export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH && export PATH=/usr/local/bin:\$PATH && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=20 && $*"
 }
 
 run_agent_pid() {
   local name="$1"; shift
-  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && source ${ROOT}/install/rl_local_controller/share/rl_local_controller/local_setup.bash && source ${ROOT}/install/temp_goal_bt/share/temp_goal_bt/local_setup.bash && source ${ROOT}/.venv/bin/activate && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=30 && $*"
+  run_cmd "$name" bash -lc "source /opt/ros/humble/setup.bash && source ${ROOT}/install/setup.bash && source ${ROOT}/install/rl_local_controller/share/rl_local_controller/local_setup.bash && source ${ROOT}/install/temp_goal_bt/share/temp_goal_bt/local_setup.bash && source ${ROOT}/.venv/bin/activate && export RCUTILS_LOGGING_SEVERITY_THRESHOLD=20 && $*"
 }
 
 # 토픽이 준비될 때까지 대기(네비게이션 초기 실패 방지)
+# ros2 topic echo --once는 토픽 없으면 ~2초 만에 종료하므로 루프로 재시도
 wait_for_topic() {
   local topic="$1"
   local timeout_sec="$2"
+  local elapsed=0
   echo "[WAIT] topic ${topic} (timeout ${timeout_sec}s)"
-  if ! timeout "${timeout_sec}" ros2 topic echo "${topic}" --once >/dev/null 2>&1; then
-    echo "[WARN] timeout waiting for ${topic}"
-  else
-    echo "[OK] ${topic} ready"
-  fi
+  while ! timeout 3 ros2 topic echo "${topic}" --once >/dev/null 2>&1; do
+    elapsed=$((elapsed + 3))
+    if [ "$elapsed" -ge "$timeout_sec" ]; then
+      echo "[WARN] timeout waiting for ${topic}"
+      return
+    fi
+    echo "[WAIT] still waiting for ${topic} (${elapsed}s / ${timeout_sec}s)..."
+  done
+  echo "[OK] ${topic} ready"
 }
 
 # TF가 준비될 때까지 대기(플래너/코스트맵 TF 오류 방지)
@@ -121,6 +127,9 @@ trap cleanup INT TERM
 
 echo "[INFO] logs: ${LOG_DIR}"
 
+# SHM 잔여 파일 정리 (이전 비정상 종료 시 남은 파일 제거)
+rm -f /dev/shm/fastrtps_* 2>/dev/null || true
+
 # 1) CAN bring-up (ignore busy/failed)
 if ! sudo ip link set can1 up type can bitrate 500000; then
   echo "[WARN] can1 up failed or busy, continuing..."
@@ -129,7 +138,7 @@ fi
 # 2) Sensors
 run_ros "livox" "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
 sleep "$SLEEP_SEC"
-run_realsense "realsense" "ros2 launch realsense2_camera rs_launch.py"
+run_realsense "realsense" "ros2 launch realsense2_camera rs_launch.py rgb_camera.color_profile:=848x480x30 depth_module.depth_profile:=848x480x30"
 sleep "$SLEEP_SEC"
 run_ros "ec25_gps" "ros2 launch ec25_gps_bridge ec25_gps_bridge.launch.py"
 sleep "$SLEEP_SEC"
@@ -139,12 +148,24 @@ run_ros "bunker_base" "ros2 launch bunker_base bunker_base.launch.py"
 sleep "$SLEEP_SEC"
 run_ros "sensor_sync" "ros2 launch rtabmap_launch sensor_sync.launch.py"
 sleep "$SLEEP_SEC"
+# IMU bias 보정 완료 후 rtabmap 시작 (icp_odometry가 rtabmap_nav2 안에서 실행됨)
+# imu_bias_corrected: bias 교정 완료 시점에 첫 메시지 발행 (publish_during_calib=false)
+
+# IMU bias 보정 완료 대기 (publish_during_calib=false → 교정 완료 시 첫 메시지 발행)
+wait_for_topic "/camera/camera/imu_bias_corrected" 60
+
+# 4) EKF 먼저 시작 (odom→base_link TF 발행 → icp_odometry의 guess_from_tf 가능)
+# EKF는 /odom(휠) + IMU만으로도 즉시 동작 가능. icp_odom은 나중에 추가됨.
 run_ros "ekf" "ros2 launch robot_localization ekf.launch.py"
 sleep "$SLEEP_SEC"
+wait_for_tf "odom" "base_link" 15
 
-# 4) RTAB-Map + Nav2
+# 5) RTAB-Map + Nav2 (icp_odometry 포함) — odom TF 준비 후 시작
 run_ros_with_nav2_env "rtabmap_nav2" "ros2 launch rtabmap_launch rtabmap_nav2.launch.py"
 sleep "$SLEEP_SEC"
+
+# icp_odom 발행 확인 (EKF가 이미 동작 중이므로 빠르게 수렴)
+wait_for_topic "/icp_odom" 30
 
 # 4.5) 핵심 토픽/TF가 준비된 뒤 agent PID 시작
 wait_for_topic "/odometry/filtered" 10

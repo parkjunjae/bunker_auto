@@ -27,6 +27,10 @@ public:
     accel_cov_ = declare_parameter<double>("accel_cov", 0.1);
     // 보정 중에도 메시지를 계속 내보낼지 여부
     publish_during_calib_ = declare_parameter<bool>("publish_during_calib", true);
+    // 초기 교정 후 정지 상태에서 bias를 EMA로 지속 업데이트할지 여부
+    // alpha: EMA 가중치 (작을수록 느리게 추적, 온도 드리프트 대응)
+    continuous_calib_ = declare_parameter<bool>("continuous_calib", true);
+    ema_alpha_ = declare_parameter<double>("ema_alpha", 0.001);
 
     auto qos = rclcpp::SensorDataQoS();
     sub_ = create_subscription<sensor_msgs::msg::Imu>(
@@ -92,8 +96,10 @@ private:
     const double mag = std::sqrt(av.x * av.x + av.y * av.y + av.z * av.z);
 
     if (!bias_ready_) {
-      // 정지 상태로 판단되면 bias 누적
-      if (mag < stationary_threshold_) {
+      // target_frame이 설정됐는데 TF를 아직 못 얻었으면 누적하지 않음
+      // (잘못된 좌표계 기준으로 bias를 추정하는 것 방지)
+      const bool tf_ok = target_frame_.empty() || has_tf;
+      if (tf_ok && mag < stationary_threshold_) {
         sum_x_ += av.x;
         sum_y_ += av.y;
         sum_z_ += av.z;
@@ -111,6 +117,11 @@ private:
                       bias_x_, bias_y_, bias_z_);
         }
       }
+    } else if (continuous_calib_ && mag < stationary_threshold_) {
+      // 초기 교정 후 정지 상태에서 EMA로 bias 지속 업데이트 (온도 드리프트 추적)
+      bias_x_ = (1.0 - ema_alpha_) * bias_x_ + ema_alpha_ * av.x;
+      bias_y_ = (1.0 - ema_alpha_) * bias_y_ + ema_alpha_ * av.y;
+      bias_z_ = (1.0 - ema_alpha_) * bias_z_ + ema_alpha_ * av.z;
     }
 
     if (!bias_ready_ && !publish_during_calib_) {
@@ -156,6 +167,8 @@ private:
   double gyro_cov_{0.1};
   double accel_cov_{0.1};
   bool publish_during_calib_{true};
+  bool continuous_calib_{true};
+  double ema_alpha_{0.001};
   bool tf_warned_{false};
 
   double sum_x_{0.0};
