@@ -358,27 +358,39 @@ def launch_setup(context, *args, **kwargs):
                 "odom/FilteringStrategy": "0", #"0=No filtering 1=Kalman filtering 2=Particle filtering. This filter is used to smooth the odometry output.
                 #---------------------------------------------------------
                 #---------------------------------------------------------
-                # 공간 기반 근접 매칭(루프클로저/드리프트 보정 강화)
-                "RGBD/ProximityBySpace": "true",
-                "RGBD/ProximityMaxGraphDepth": "15",     # 전체 그래프까지 근접 탐색
-                "RGBD/ProximityPathMaxNeighbors": "1",  # 근접 링크를 늘려 경로 정합 보강
-                # 노드 생성 간격: 너무 촘촘하면(0.05°) odom 오차가 누적됨
-                # 0.15rad(8.6°) 단위로 노드 생성 → ICP 수렴 안정성 확보
-                "RGBD/LinearUpdate": "0.10",
-                "RGBD/AngularUpdate": "0.15",
-                # 처리 주기(Hz) - 회전 보정 반응속도 향상
+                # 공간 기반 근접 매칭 — 제자리 회전 시 map→odom 불안정 원인
+                # ProximityBySpace: 같은 위치의 회전 노드들끼리 ICP 링크 생성 →
+                # "회전했다(odom)" vs "같은 자리다(proximity)" 모순 → 그래프 최적화 오동작
+                # 루프클로저는 시각적 BoW(bag-of-words) 방식으로 대체
+                "RGBD/ProximityBySpace": "false",
+                "RGBD/ProximityMaxGraphDepth": "0",
+                "RGBD/ProximityPathMaxNeighbors": "0",
+                
+                "RGBD/LinearUpdate": "0.50",
+                "RGBD/AngularUpdate": "6.28",
+                # 처리 주기(Hz)
                 "Rtabmap/DetectionRate": "5.0",
                 #---------------------------------------------------------
                 # loop closure와 그래프 최적화의 성격을 정하는 옵션
                 "Optimizer/Strategy": "1", # 1 = g2o (TORO 대비 prior/gravity 링크 처리에 유리)
-                "Reg/Strategy": "2",   # 0 = Vis(카메라), 1 = ICP(라이다), 2 = Vis+ICP
+                # Robust 최적화: Huber 비용함수로 outlier 제약 하중 감소
+                # → 회전 중 부정확한 ICP 등록 결과가 map→odom에 전파되는 것을 방지
+                "Optimizer/Robust": "true",
+                "Reg/Strategy": "1",   # 0 = Vis(카메라), 1 = ICP(라이다), 2 = Vis+ICP
+                # ICP만 사용: 카메라 시각 매칭 실패 시 루프클로저 블로킹 방지
+                # 제자리 회전 후 LiDAR 스캔 매칭으로 루프클로저 → 맵 보정
                 "Reg/Force3DoF": "true", #정합(등록) 결과를 **3자유도(평면)**로 강제하는 옵션 로봇 포즈를 x, y, yaw만 쓰고 z, roll, pitch 변화를 무시/억제
-                # SLAM 등록용 ICP: PointToPlane 활성화 (순수 회전에서 수렴 안정)
+                # SLAM 등록용 ICP — odom ICP와 동일 파라미터로 통일
+                # (불일치 시 odom vs 등록 결과 차이 → 매 노드마다 map→odom 조정 발생)
+                "Icp/VoxelSize": "0.15",
                 "Icp/PointToPlane": "true",
                 "Icp/PointToPlaneK": "8",
-                "RGBD/OptimizeMaxError": "0.5",        # (예시) 최적화 허용 오차 제한
-                "Rtabmap/LoopThr": "0.30",             # 루프 성립 임계(너무 높으면 루프가 안 잡힘)
-                "Vis/MinInliers": "30",                # 시각 매칭 최소 인라이어 수(루프 안정성)
+                "Icp/MaxCorrespondenceDistance": "0.3",
+                "Icp/OutlierRatio": "0.7",
+                "Icp/CorrespondenceRatio": "0.01",
+                "RGBD/OptimizeMaxError": "0.5",
+                "Rtabmap/LoopThr": "0.50",             # 루프 성립 임계 강화 (0.30→0.50): 회전 중 false loop 방지
+                "Vis/MinInliers": "50",                # 시각 매칭 최소 인라이어 수 강화 (30→50)
                 #--------------------------------------------------------
                 # origin 기준 최적화: loop closure 시 맵이 아닌 로봇 위치가 보정됨 → 맵 뒤틀림 방지
                 "RGBD/OptimizeFromGraphEnd": "false",
@@ -574,7 +586,7 @@ def generate_launch_description():
         DeclareLaunchArgument('subscribe_scan',       default_value='false',       description=''),
         DeclareLaunchArgument('scan_topic',           default_value='/scan',       description=''),
         DeclareLaunchArgument('subscribe_scan_cloud', default_value='true',       description=''),
-        DeclareLaunchArgument('scan_cloud_topic',     default_value='/livox/lidar/static_filtered', description=''),
+        DeclareLaunchArgument('scan_cloud_topic',     default_value='/livox/lidar/synced/deskewed', description=''),
         DeclareLaunchArgument('icp_odom_scan_topic',  default_value='/livox/lidar/synced/deskewed', description='Scan topic for icp_odometry only (separate from rtabmap scan_cloud_topic to avoid TF deadlock).'),
         DeclareLaunchArgument('scan_normal_k',        default_value='0',           description=''),
         

@@ -75,6 +75,14 @@ def generate_launch_description():
             'stationary_threshold': 0.003,  # 더 엄격한 정지 판단 (미세 진동 포함 상태 제외)
             'gyro_cov': 0.01,  # 휠 vyaw(0.02)보다 낮게: IMU가 주도 → 제자리 회전 시 슬립 보정 효과
             'accel_cov': 0.01,
+            # 정지 구간 yaw drift 억제: EKF에 0 yaw rate를 강하게 주입
+            'yaw_zeroing_enable': True,
+            'yaw_zero_threshold': 0.03,             # |wz|<0.03rad/s면 정지 후보
+            'gyro_xy_stationary_threshold': 0.05,   # roll/pitch rate 정지 조건
+            'accel_stationary_threshold': 0.7,      # ||a|-g| 정지 조건
+            'gravity_mps2': 9.81,
+            'yaw_stationary_cov': 1.0e-4,           # 정지 시 z축 공분산(작게)
+            'yaw_moving_cov': 0.01,                 # 회전 시 z축 공분산
             'publish_during_calib': False,
             'continuous_calib': True,   # 초기 교정 후 정지 상태에서 EMA로 bias 지속 추적
             'ema_alpha': 0.001,         # 50Hz × 1000 스텝 ≈ 20초 시정수 (온도 드리프트 추적)

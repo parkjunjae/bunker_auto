@@ -32,6 +32,23 @@ public:
     continuous_calib_ = declare_parameter<bool>("continuous_calib", true);
     ema_alpha_ = declare_parameter<double>("ema_alpha", 0.001);
 
+    // 정지 구간 yaw drift 억제 파라미터
+    // - yaw_zeroing_enable: true면 정지로 판단될 때 angular_velocity.z를 0으로 고정
+    // - yaw_zero_threshold: |wz|가 이 값보다 작으면 정지 후보
+    // - gyro_xy_stationary_threshold: roll/pitch rate가 작아야 정지로 인정
+    // - accel_stationary_threshold: | |a|-g |가 작아야 정지로 인정
+    // - yaw_stationary_cov: 정지 고정 시 z축 공분산(작을수록 EKF가 0을 더 신뢰)
+    // - yaw_moving_cov: 비정지 시 z축 공분산
+    yaw_zeroing_enable_ = declare_parameter<bool>("yaw_zeroing_enable", true);
+    yaw_zero_threshold_ = declare_parameter<double>("yaw_zero_threshold", 0.03);
+    gyro_xy_stationary_threshold_ =
+      declare_parameter<double>("gyro_xy_stationary_threshold", 0.05);
+    accel_stationary_threshold_ =
+      declare_parameter<double>("accel_stationary_threshold", 0.7);
+    gravity_mps2_ = declare_parameter<double>("gravity_mps2", 9.81);
+    yaw_stationary_cov_ = declare_parameter<double>("yaw_stationary_cov", 1e-4);
+    yaw_moving_cov_ = declare_parameter<double>("yaw_moving_cov", gyro_cov_);
+
     auto qos = rclcpp::SensorDataQoS();
     sub_ = create_subscription<sensor_msgs::msg::Imu>(
       input_topic_, qos,
@@ -143,6 +160,7 @@ private:
                                            0.0, accel_cov_, 0.0,
                                            0.0, 0.0, accel_cov_};
 
+    bool yaw_clamped = false;
     if (bias_ready_) {
       // bias 제거 후 각속도 재발행
       out.angular_velocity.x = av.x - bias_x_;
@@ -155,6 +173,44 @@ private:
       out.angular_velocity = av;
       out.linear_acceleration = la;
     }
+
+    // 정지 판정 시 yaw rate를 0으로 고정해 EKF yaw 드리프트 적분을 차단
+    if (yaw_zeroing_enable_) {
+      const double wx = out.angular_velocity.x;
+      const double wy = out.angular_velocity.y;
+      const double wz = out.angular_velocity.z;
+      const double acc_norm = std::sqrt(
+        out.linear_acceleration.x * out.linear_acceleration.x +
+        out.linear_acceleration.y * out.linear_acceleration.y +
+        out.linear_acceleration.z * out.linear_acceleration.z);
+
+      const bool low_yaw_rate = std::fabs(wz) < yaw_zero_threshold_;
+      const bool low_roll_pitch_rate =
+        std::fabs(wx) < gyro_xy_stationary_threshold_ &&
+        std::fabs(wy) < gyro_xy_stationary_threshold_;
+      const bool accel_near_g =
+        std::fabs(acc_norm - gravity_mps2_) < accel_stationary_threshold_;
+
+      yaw_clamped = low_yaw_rate && low_roll_pitch_rate && accel_near_g;
+      if (yaw_clamped) {
+        out.angular_velocity.z = 0.0;
+      }
+    }
+
+    // z축 공분산을 상태별로 나눠 EKF 신뢰도를 제어한다.
+    const double yaw_cov = yaw_clamped ? yaw_stationary_cov_ : yaw_moving_cov_;
+    out.angular_velocity_covariance = {gyro_cov_, 0.0, 0.0,
+                                       0.0, gyro_cov_, 0.0,
+                                       0.0, 0.0, yaw_cov};
+    if (yaw_clamped != last_yaw_clamped_) {
+      last_yaw_clamped_ = yaw_clamped;
+      RCLCPP_INFO(get_logger(),
+                  "yaw_zeroing=%s (wz=%.5f, yaw_cov=%.6f)",
+                  yaw_clamped ? "ON" : "OFF",
+                  out.angular_velocity.z,
+                  yaw_cov);
+    }
+
     pub_->publish(out);
   }
 
@@ -170,6 +226,14 @@ private:
   bool continuous_calib_{true};
   double ema_alpha_{0.001};
   bool tf_warned_{false};
+  bool yaw_zeroing_enable_{true};
+  double yaw_zero_threshold_{0.03};
+  double gyro_xy_stationary_threshold_{0.05};
+  double accel_stationary_threshold_{0.7};
+  double gravity_mps2_{9.81};
+  double yaw_stationary_cov_{1e-4};
+  double yaw_moving_cov_{0.1};
+  bool last_yaw_clamped_{false};
 
   double sum_x_{0.0};
   double sum_y_{0.0};

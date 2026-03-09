@@ -51,8 +51,10 @@ def generate_launch_description():
             'map_frame_id': 'map',
             'publish_tf_map': 'true',
             'visual_odometry': 'false',
-            'icp_odometry': 'true',   # LiDAR ICP odometry 활성화 → 휠 슬립/IMU bias 우회
-            'odom_args': '--Icp/VoxelSize 0.10 --Icp/PointToPlane 0 --Icp/MaxCorrespondenceDistance 0.5 --Icp/MaxTranslation 2.0 --Icp/MaxRotation 6.28 --Icp/CorrespondenceRatio 0.01 --Icp/OutlierRatio 0.7 --Icp/MaxIterations 50 --Icp/Epsilon 0.001 --Odom/GuessMotion true --Odom/ResetCountdown 5 --Reg/Force3DoF true',
+            # IMU+EKF 기반으로 전환: RTAB-Map 내부 ICP odometry 비활성화
+            'icp_odometry': 'false',
+            # icp_odometry 비활성화 시 odom_args는 사용되지 않으므로 비움
+            'odom_args': '',
             'log_level': 'error',  
             'odom_log_level': 'error',  # Odometry 로그도 error 레벨로
             'qos': '2',  # BEST_EFFORT QoS for Nav2 compatibility
@@ -71,7 +73,7 @@ def generate_launch_description():
             'database_path': database_path,
             'delete_db_on_start': delete_db_on_start,  # DB reset via ROS param
             # RTAB-Map(그래프/맵)에는 dynamic_filter 결과를 사용 (이동 물체 제거)
-            'scan_cloud_topic': dynamic_filter_output,
+            'scan_cloud_topic': livox_deskewed_topic,
             # icp_odometry에는 원본 deskewed 스캔 직접 사용
             # (dynamic_filter는 odom TF 필요 → EKF 필요 → icp_odom 필요 → 데드락)
             'icp_odom_scan_topic': livox_deskewed_topic,

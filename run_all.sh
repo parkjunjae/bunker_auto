@@ -128,7 +128,9 @@ trap cleanup INT TERM
 echo "[INFO] logs: ${LOG_DIR}"
 
 # SHM 잔여 파일 정리 (이전 비정상 종료 시 남은 파일 제거)
+# sem.fastrtps_* semaphore도 함께 제거해야 pthread_mutex_lock assertion 방지
 rm -f /dev/shm/fastrtps_* 2>/dev/null || true
+rm -f /dev/shm/sem.fastrtps_* 2>/dev/null || true
 
 # 1) CAN bring-up (ignore busy/failed)
 if ! sudo ip link set can1 up type can bitrate 500000; then
@@ -148,12 +150,6 @@ run_ros "bunker_base" "ros2 launch bunker_base bunker_base.launch.py"
 sleep "$SLEEP_SEC"
 run_ros "sensor_sync" "ros2 launch rtabmap_launch sensor_sync.launch.py"
 sleep "$SLEEP_SEC"
-# IMU bias 보정 완료 후 rtabmap 시작 (icp_odometry가 rtabmap_nav2 안에서 실행됨)
-# imu_bias_corrected: bias 교정 완료 시점에 첫 메시지 발행 (publish_during_calib=false)
-
-# IMU bias 보정 완료 대기 (publish_during_calib=false → 교정 완료 시 첫 메시지 발행)
-wait_for_topic "/camera/camera/imu_bias_corrected" 60
-
 # 4) EKF 먼저 시작 (odom→base_link TF 발행 → icp_odometry의 guess_from_tf 가능)
 # EKF는 /odom(휠) + IMU만으로도 즉시 동작 가능. icp_odom은 나중에 추가됨.
 run_ros "ekf" "ros2 launch robot_localization ekf.launch.py"

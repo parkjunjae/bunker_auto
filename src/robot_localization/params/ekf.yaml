@@ -12,7 +12,7 @@ ekf_filter_node:
 
     publish_tf: true # odom -> base_link TF를 EKF가 직접 publish
     transform_time_offset: 0.0 # TF 타임스탬프 오프셋(sec), 필요 시 미래/과거 보정
-    predict_to_current_time: true # EKF가 마지막 센서 시각 이후부터 “현재 시각”까지 상태를 한 번 더 예측(적분)해서 내보낼지를 정하는 옵션
+    predict_to_current_time: false # 정지 중 잔류 각속도 상태를 추가 적분하지 않도록 비활성화
 
     # Wheel odometry 입력
     odom0: /odom # 바퀴 오도메트리 토픽
@@ -33,7 +33,7 @@ ekf_filter_node:
         false, # vz
         false, # vroll
         false, # vpitch
-        true, # vyaw (IMU bias 드리프트를 휠 vyaw로 견제)
+        false, # vyaw ← 비활성화: 트랙 슬립으로 회전 중 완전히 틀린 값 발생
         false, # ax
         false, # ay
         false, # az
@@ -41,34 +41,12 @@ ekf_filter_node:
     # robot_localization은 odom*_twist_covariance_override 파라미터를 지원하지 않는다.
     # 공분산은 odom 퍼블리셔(bunker_base)에서 채워서 EKF에 전달한다.
 
-    # ICP odometry 입력 (LiDAR 스캔 매칭 기반 → 휠 슬립/IMU bias 우회, yaw 정확)
-    odom1: /icp_odom
-    odom1_queue_size: 10
-    odom1_differential: false
-    odom1_relative: false
-    odom1_config: [
-        false, # x
-        false, # y
-        false, # z
-        false, # roll
-        false, # pitch
-        false, # yaw
-        false, # vx (직선 속도는 휠 odom이 더 안정적)
-        false, # vy
-        false, # vz
-        false, # vroll
-        false, # vpitch
-        true,  # vyaw ← ICP로 계산한 yaw rate: 슬립/IMU bias 없음
-        false, # ax
-        false, # ay
-        false, # az
-      ]
-
-    # IMU 입력
+    # IMU 입력 (ICP vyaw 대신 카메라 IMU yaw rate를 주 입력으로 사용)
     imu0: /camera/camera/imu_fixed # 보정된 IMU 토픽
     imu0_queue_size: 200 # IMU 큐 크기(고주파 센서라 크게 설정)
     imu0_differential: false # 절대 orientation/각속도 사용
     imu0_relative: false # 상대 누적을 끄고 yaw rate만 보조로 사용
+    imu0_twist_rejection_threshold: 1.5 # 비정상 yaw rate 스파이크(rad/s) 차단
     imu0_remove_gravitational_acceleration: false # 가속도에서 중력 성분 제거 여부
     # imu0_config 순서는 odom0_config와 동일
     imu0_config: [
@@ -83,7 +61,7 @@ ekf_filter_node:
         false, # vz
         false, # vroll
         false, # vpitch
-        false, # vyaw (IMU 양자화 노이즈 + 잔류 bias → 정지 시 드리프트 불가피, 비활성화)
+        true,  # vyaw ← IMU yaw rate를 odom->base_link 회전 추종의 주 입력으로 사용
         false, # ax
         false, # ay
         false, # az

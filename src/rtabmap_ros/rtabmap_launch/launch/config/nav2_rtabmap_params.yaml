@@ -255,7 +255,7 @@ local_costmap:
           obstacle_range: 3.0
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
-          observation_persistence: 0.25 # filtered delay max 138ms + 여유 2주기(100ms) = 238ms → 0.25s
+          observation_persistence: 0.3 # 0.25s→1.0s: 지연/드롭 시 장애물 깜빡임 방지
           expected_update_rate: 0.0 # 드롭 무시
 
         lidar_clear:
@@ -279,7 +279,7 @@ local_costmap:
           obstacle_range: 1.5 # 근거리 보강용
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
-          observation_persistence: 0.2 # 카메라 30Hz 기준 6주기 유지
+          observation_persistence: 0.5 # 0.2s→0.5s: 카메라 드롭 시 깜빡임 방지
           expected_update_rate: 0.0
 
       # voxel_layer:  # 필요 시 다시 사용 (3D voxel)
@@ -370,7 +370,7 @@ global_costmap:
         enabled: true
         # 글로벌은 정적 위주로 유지: mark만 사용 (동적은 static_filtered에서 이미 제거)
         footprint_clearing_enabled: true
-        observation_sources: lidar_mark
+        observation_sources: lidar_mark lidar_clear
 
         lidar_mark:
           topic: /livox/lidar/filtered
@@ -380,8 +380,17 @@ global_costmap:
           obstacle_range: 4.0
           min_obstacle_height: 0.05
           max_obstacle_height: 1.8
-          # filtered delay max 138ms + 여유 2주기(100ms) = 238ms → 0.25s
-          observation_persistence: 0.25
+          observation_persistence: 1.0 # 0.25s→1.0s: 지연/드롭 시 장애물 깜빡임 방지
+          expected_update_rate: 0.0
+        
+        lidar_clear:
+          topic: /livox/lidar/static_filtered
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          raytrace_range: 5.0
+          min_obstacle_height: 0.05
+          max_obstacle_height: 1.8
           expected_update_rate: 0.0
 
       # ========================================================================

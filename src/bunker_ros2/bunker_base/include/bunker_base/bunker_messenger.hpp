@@ -267,7 +267,7 @@ class BunkerMessenger {
     odom_msg.twist.covariance[14] = 1e6;   // vz (unused)
     odom_msg.twist.covariance[21] = 1e6;   // vroll (unused)
     odom_msg.twist.covariance[28] = 1e6;   // vpitch (unused)
-    odom_msg.twist.covariance[35] = 0.02;   // vyaw
+    odom_msg.twist.covariance[35] = 1.0;   // vyaw
 
     odom_pub_->publish(odom_msg);
   }

@@ -7,4 +7,10 @@ install(DIRECTORY launch
    DESTINATION share/${PROJECT_NAME}
 )
 
+install(PROGRAMS 
+   scripts/icp_odom_cov_scale.py
+   scripts/map_tf_stabilizer.py
+   DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

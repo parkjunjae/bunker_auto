@@ -29,6 +29,14 @@ def generate_launch_description():
             'stationary_threshold': 0.01,
             'gyro_cov': 0.1,
             'accel_cov': 0.1,
+            # 정지 구간 yaw drift 억제
+            'yaw_zeroing_enable': True,
+            'yaw_zero_threshold': 0.03,
+            'gyro_xy_stationary_threshold': 0.05,
+            'accel_stationary_threshold': 0.7,
+            'gravity_mps2': 9.81,
+            'yaw_stationary_cov': 1.0e-4,
+            'yaw_moving_cov': 0.1,
             'publish_during_calib': True,
         }],
     )
