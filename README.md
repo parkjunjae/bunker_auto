@@ -866,3 +866,63 @@ ros2 run tf2_ros tf2_echo map odom
 | `src/rtabmap_ros/rtabmap_launch/launch/rtabmap_nav2.launch.py` | PointToPlane 0→1, PointToPlaneK=8, MaxCorrespondenceDistance 0.5→0.3 |
 | `src/rtabmap_ros/rtabmap_launch/launch/rtabmap.launch.py` | ProximityBySpace false, AngularUpdate 0.15→1.0, **Optimizer/Robust=true(신규)**, **ICP파라미터 odom과 통일(신규)**, LoopThr 0.30→0.50, MinInliers 30→50 |
 | `src/robot_localization/params/ekf.yaml` | odom1=/icp_odom_filtered, vyaw=true (변경 없음 — 이미 적용됨) |
+
+### 15) 26/03/09 핵심적인 수정사항 
+
+- 카메라 bias는 여기서 카메라 IMU(gyro)의 영점 오프셋입니다.
+- 정지 상태에서 진짜 각속도는 0이어야 하는데, 센서는 보통 -0.42 rad/s 같은 상수 오차를 갖습니다.
+
+수식으로 보면:
+```bash
+w_meas = w_true + b + noise
+```
+여기서 b가 bias이고, 이를 빼지 않으면 EKF가 yaw를 계속 적분해서 TF 드리프트가 납니다.
+
+현재 소스는 이렇게 동작합니다.
+
+- 파라미터 초기화
+camera_imu_bias_corrector.cpp (line 13)
+입출력 토픽, 캘리브레이션 샘플 수, 공분산, 정지 yaw 클램프 파라미터를 선언합니다.
+핵심 신규 파라미터는 35~50행 (line 35)입니다.
+
+**IMU 구독/발행**
+53~56행 (line 53)
+/camera/camera/imu를 받아 보정 후 /camera/camera/imu_bias_corrected로 냅니다.
+
+**프레임 변환**
+77~111행 (line 77)
+target_frame이 있으면 TF로 gyro/accel 벡터를 회전시켜 기준 프레임을 맞춥니다.
+
+**초기 bias 캘리브레이션**
+115~135행 (line 115)
+정지로 판단된 샘플(mag < stationary_threshold)을 calib_samples만큼 모아 평균값을 bias_x/y/z로 확정합니다.
+
+**연속 bias 추적(EMA)**
+137~142행 (line 137)
+초기 보정 후에도 정지 구간에서 EMA로 bias를 천천히 업데이트합니다(온도 드리프트 대응).
+
+**보정값 적용**
+163~175행 (line 163)
+out.angular_velocity = av - bias 형태로 실제 출력 각속도를 만듭니다.
+
+**정지 시 yaw 드리프트 차단(이번 핵심 수정)**
+177~198행 (line 177)
+아래 3조건을 모두 만족하면 정지로 보고 angular_velocity.z = 0.0 강제:
+
+```bash
+|wz| < yaw_zero_threshold
+|wx|, |wy| 작음
+||a||가 g 근처
+z축 공분산 상태별 적용
+```
+200~204행 (line 200)
+- 정지면 yaw_stationary_cov(작게), 이동이면 yaw_moving_cov(크게)로 넣어 EKF 신뢰도를 분리합니다.
+
+런치 기본값도 같이 넣어둔 상태입니다.
+
+- sensor_sync.launch.py (line 78)
+imu_pipeline_cpp.launch.py (line 32)
+즉, 현재 코드는 bias 평균 보정 + 정지 yaw 강제 0 + 공분산 게이팅 3단으로 드리프트를 막는 구조입니다.
+
+
+

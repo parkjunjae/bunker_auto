@@ -181,7 +181,7 @@ private:
       const double wz = out.angular_velocity.z;
       const double acc_norm = std::sqrt(
         out.linear_acceleration.x * out.linear_acceleration.x +
-        out.linear_acceleration.y * out.linear_acceleration.y +
+        out.linear_acceleration.y * out.lin`````````````````````````````````````````ear_acceleration.y +
         out.linear_acceleration.z * out.linear_acceleration.z);
 
       const bool low_yaw_rate = std::fabs(wz) < yaw_zero_threshold_;
