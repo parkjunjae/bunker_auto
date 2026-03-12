@@ -456,3 +456,290 @@ pure spin 동안:
 그 경우 다음 단계는:
 
 **consumer-side stable map layer가 아니라 raw map redraw source-level gating 또는 RTAB-Map publish path 분석**으로 넘어가야 한다.
+
+---
+
+## 13. `map_topic_stabilizer` 파라미터 설정 이유
+
+이번 stable map relay 구현은 단순히 “토픽 하나 더 만들기”가 아니라,
+pure spin 동안 raw `/rtabmap/map` redraw가 consumer에 바로 전파되지 않도록
+hold-last-good / translation-based refresh 정책을 넣은 것이다.
+
+따라서 파라미터는 다음 네 원칙에 맞춰 잡았다.
+
+1. pure spin은 빨리 감지한다.
+2. 일반 회전/곡선 주행은 hold 대상이 아니어야 한다.
+3. hold는 pure spin에서만 유지한다.
+4. 복귀는 회전 종료가 아니라 translation 재개 기준으로 한다.
+
+### 13.1 입력/주기 파라미터
+
+#### `tick_hz = 20.0`
+
+의미:
+
+- relay 판단 주기
+
+이유:
+
+1. local odom/EKF 계층과 비슷한 수준의 주기로 돌리기 위함
+2. pure spin 진입/해제가 너무 늦지 않게 하기 위함
+3. 과도한 CPU 부하나 로그량 증가는 피하기 위함
+
+#### `input_map_topic = /rtabmap/map`
+#### `output_map_topic = /rtabmap/map_stable`
+
+의미:
+
+- raw source와 consumer-facing source 분리
+
+이유:
+
+1. raw map redraw는 계속 관측하되
+2. Nav2/RViz는 stable map만 소비하게 하기 위함
+
+#### `stable_map_frame_id = map_stable`
+
+의미:
+
+- stable map의 `header.frame_id`
+
+이유:
+
+1. 현재 TF 체인이 `map_stable -> map -> odom -> base_link`이므로
+2. stable map도 `map_stable` 기준으로 보여야 TF와 map 해석이 일치함
+
+### 13.2 pure spin 검출 파라미터
+
+이 값들은 [map_tf_stabilizer.py](/home/atoz/ca_ws/src/rtabmap_ros/rtabmap_launch/scripts/map_tf_stabilizer.py)와 같은 pure spin 창을 보도록 맞췄다.
+
+즉 목표는:
+
+- TF layer와 map layer가 서로 다른 spin 구간을 보는 상황을 피하는 것
+
+#### `wz_filter_tau_sec = 0.06`
+
+의미:
+
+- IMU `wz` EMA 필터 시정수
+
+이유:
+
+1. pure spin 시작을 빨리 잡아야 함
+2. 한두 샘플 노이즈로 즉시 흔들리면 안 됨
+3. 그래서 짧은 시정수로 빠르게 반응하되 약간의 jitter는 제거
+
+#### `speed_filter_tau_sec = 0.12`
+
+의미:
+
+- odom speed EMA 필터 시정수
+
+이유:
+
+1. speed는 IMU보다 jitter가 더 큰 편
+2. pure spin 여부를 볼 때 translation speed가 샘플 단위로 흔들리면 hold 경계가 불안정해짐
+3. 그래서 `wz`보다 느리게 필터링
+
+#### `spin_wz_start = 0.08`
+
+의미:
+
+- pure spin 후보로 보기 시작하는 최소 `|wz|`
+
+이유:
+
+1. 이전 분석에서 실제 problematic spin이 `~0.10 rad/s` 근처에서도 나타남
+2. 예전 `0.35` 같은 값으로는 pure spin을 놓쳤음
+3. 그래서 실제 문제 구간 바로 아래로 내림
+
+#### `spin_wz_full = 0.18`
+
+의미:
+
+- `wz`만 봐도 pure spin score가 거의 충분히 올라가는 상단 기준
+
+이유:
+
+1. `0.08`부터 감지는 시작하되
+2. `0.18` 정도면 “이건 명확한 pure spin”으로 봄
+3. 너무 낮으면 일반 회전도 pure spin으로 오인
+4. 너무 높으면 fast spin을 또 늦게 잡음
+
+#### `spin_speed_quiet = 0.05`
+
+의미:
+
+- pure spin으로 인정할 수 있는 최대 translation speed 근처 기준
+
+이유:
+
+1. pure spin은 translation이 거의 없어야 함
+2. 하지만 odom 노이즈와 미끄러짐 때문에 완전 0을 요구하면 검출이 불안정해짐
+3. 약간의 residual translation은 허용하되, 움직이며 회전하는 구간과는 분리하려는 값
+
+### 13.3 score 구성 파라미터
+
+#### `spin_duration_ref_sec = 0.80`
+
+의미:
+
+- “지속 pure spin”이라고 확신하기 위한 시간 스케일
+
+이유:
+
+1. joystick twitch와 지속 pure spin을 구분하려는 목적
+2. 너무 짧으면 순간 회전에도 hold가 걸림
+3. 너무 길면 pure spin 감지가 늦어짐
+
+#### `spin_yaw_ref_rad = 0.20`
+
+의미:
+
+- 누적 yaw 기준
+
+이유:
+
+1. 시간만 보면 low-rate spin과 short twitch를 구분하기 어렵다
+2. 실제 회전량도 같이 봐야 함
+3. 약 `11.5도` 정도 누적되면 “pure spin이 실제로 진행 중”이라는 느린 증거로 충분하다고 봄
+
+#### `spin_decay_sec = 0.80`
+
+의미:
+
+- spin evidence를 잊는 시간 상수
+
+이유:
+
+1. pure spin이 끝나면 score가 바로 0이 되면 경계에서 흔들림
+2. 너무 오래 남으면 hold가 지나치게 길어짐
+3. 따라서 evidence를 적당히 천천히 감쇠
+
+#### `score_fast_weight = 0.75`
+#### `score_slow_weight = 0.25`
+
+의미:
+
+- fast term / slow term 가중치
+
+이유:
+
+1. 이번 문제는 “감지를 못해서 늦다”가 더 컸음
+2. 따라서 `wz + 저속 speed` 기반 fast term에 더 큰 비중을 둠
+3. duration/누적 yaw는 보조 확신 성분만 담당
+
+#### `score_rise_tau_sec = 0.05`
+#### `score_fall_tau_sec = 0.50`
+
+의미:
+
+- pure spin score의 상승/하강 응답 시간
+
+이유:
+
+1. spin 시작은 빨리 감지해야 함
+2. spin 종료는 조금 더 천천히 내려가야 hold 경계에서 흔들리지 않음
+
+### 13.4 hold / refresh 정책 파라미터
+
+이 값들이 stable map layer의 본체다.
+
+#### `hold_enter_score = 0.55`
+
+의미:
+
+- hold-last-good map 진입 기준
+
+이유:
+
+1. pure spin 확신이 충분할 때만 hold를 걸어야 함
+2. score가 조금 오른 것만으로 hold하면 일반 회전/곡선 주행도 stale map이 됨
+
+#### `hold_exit_score = 0.20`
+
+의미:
+
+- hold 해제 기준
+
+이유:
+
+1. enter보다 충분히 낮아야 hysteresis가 생김
+2. pure spin 경계에서 hold on/off 떨림을 막음
+
+#### `translation_release_speed = 0.06`
+
+의미:
+
+- stable map refresh를 다시 허용하기 위한 translation evidence 기준
+
+이유:
+
+1. “회전이 끝났다”는 이유만으로 raw map을 바로 복귀시키면 안 됨
+2. pure spin이 아니라 실제 이동이 다시 생겼을 때만 global map을 다시 믿도록 하기 위함
+
+#### `translation_release_hold_sec = 0.30`
+
+의미:
+
+- translation evidence가 유지되어야 하는 최소 시간
+
+이유:
+
+1. 한두 샘플 speed 튐만으로 refresh를 열면 snap-back 위험이 큼
+2. 실제 주행 재개인지 짧게 확인하기 위한 값
+
+#### `refresh_settle_sec = 0.25`
+
+의미:
+
+- hold 해제 직후 raw map으로 바로 갈아타지 않기 위한 settle 시간
+
+이유:
+
+1. hold가 풀렸다고 즉시 raw map을 쓰면 종료 후 jump가 날 수 있음
+2. 짧게 안정화한 뒤 refresh하도록 하기 위함
+
+#### `max_hold_sec = 4.0`
+
+의미:
+
+- stable map hold 최대 시간
+
+이유:
+
+1. pure spin이 너무 길어지면 stale map을 영원히 유지할 수 없음
+2. long pure spin에서는 timeout 경로도 열어둬야 함
+3. 다만 이 값은 이후 실차에서 다시 조정될 가능성이 큼
+
+#### `log_period_sec = 0.05`
+
+의미:
+
+- 현재 단계의 디버깅용 로그 주기
+
+이유:
+
+1. 이번 분석은 high-rate 관측이 필요함
+2. pure spin 진입/유지/해제 타이밍을 촘촘히 보기 위한 값
+3. 운영 기본값이라기보다 현재 진단 단계용 값
+
+### 13.5 Nav2 static layer 변경 이유
+
+이번 1차 구현에서 아래도 같이 바꿨다.
+
+- `map_topic: /rtabmap/map_stable`
+- `subscribe_to_updates: false`
+
+이유:
+
+1. 이번 단계는 full OccupancyGrid relay만 구현
+2. `/rtabmap/map_updates` incremental path까지 같이 다루면 범위가 커짐
+3. 우선은 “raw full map redraw 전파 차단”만 확인
+4. incremental update relay는 다음 단계로 미룸
+
+### 13.6 이번 파라미터 세트의 의미
+
+한 문장으로 정리하면:
+
+**pure spin은 빨리 잡고, 일반 회전은 hold하지 않으며, pure spin 동안에는 last-good map을 유지하고, 회전 종료가 아니라 translation 재개를 기준으로 raw map을 다시 수용하도록 만든 값들**이다.
