@@ -1,6 +1,6 @@
 # Bunker 자율주행 로봇 시스템 — 심층 연구 보고서
 
-작성일: 2026-03-09
+작성일: 2026-03-10 (v2 — ICP→IMU 3단계 보정 전환 반영)
 분석 대상: `/home/atoz/ca_ws` (ROS2 Humble 기반 Bunker 자율주행 로봇)
 
 ---
@@ -22,9 +22,9 @@
    - 4.9 ec25_gps_bridge (GPS 브리지)
    - 4.10 traversability_layer (지형 통과 가능성 레이어)
 5. [핵심 알고리즘 심층 분석](#5-핵심-알고리즘-심층-분석)
-   - 5.1 ICP Odometry & PointToPlane
-   - 5.2 EKF 이중 오도메트리 전략
-   - 5.3 icp_odom_cov_scale 동적 공분산 조정
+   - 5.1 IMU 3단계 바이어스 보정 & EKF vyaw 전략
+   - 5.2 ICP Odometry & PointToPlane (SLAM 전용)
+   - 5.3 아키텍처 전환 이력: ICP→IMU (v1→v2)
    - 5.4 LiDAR Deskewing
    - 5.5 PPO 기반 실시간 PID 게인 적응
    - 5.6 RTAB-Map 그래프 최적화
@@ -44,10 +44,10 @@
 
 | 혁신 | 설명 |
 |------|------|
-| **ICP-EKF 이중 오도메트리** | 휠 슬립과 IMU 양자화 노이즈를 동시에 극복하는 이중 소스 퓨전 |
-| **PointToPlane ICP** | 순수 회전 시 안정적인 yaw 추정 |
+| **IMU 3단계 바이어스 보정** | 초기 평균 캘리브레이션 + EMA 연속 추적 + 정지 yaw 강제 0 & 공분산 게이팅 |
+| **Camera IMU vyaw 기반 EKF** | IMU 양자화 한계를 3단계 보정으로 극복, ICP 의존 제거 |
 | **PPO 실시간 PID 조정** | stable-baselines3 학습 모델이 9차원 관측으로 PID 게인을 실시간 조정 |
-| **동적 공분산 스케일링** | cmd_vel 상태에 따라 ICP vyaw 신뢰도를 동적으로 조정 |
+| **PointToPlane ICP (SLAM 등록)** | RTAB-Map 노드 등록 시 법선벡터 기반 ICP로 회전 정합 안정화 |
 | **좁은 통로 탈출** | Nav2 로컬 플래너가 벽 충돌 없이 좁은 공간에서 탈출 |
 
 ### 전체 패키지 목록
@@ -97,14 +97,17 @@ EC25 모뎀 (2Hz)
 
 [센서 퓨전 레이어]
 ─────────────────────────────────────────────────────────────────
-/livox/lidar/synced/deskewed
-  └─ rtabmap ICP 오도메트리 ──────────────────► /icp_odom
-  └─ icp_odom_cov_scale.py ──────────────────► /icp_odom_filtered
-                                                  (cov[35]: SCALE 적용)
+/camera/camera/imu (200Hz)
+  └─ camera_imu_bias_corrector ─────────────► /camera/camera/imu_bias_corrected
+       (3단계: 초기 bias 평균 + EMA 연속추적 + 정지 yaw=0 강제 & cov 게이팅)
+  └─ imu_filter_madgwick ──────────────────► /camera/camera/imu_fixed
 
-/odom (vx) + /icp_odom_filtered (vyaw)
+/odom (vx) + /camera/camera/imu_fixed (vyaw)
   └─ robot_localization EKF ──────────────────► /odometry/filtered
                                                ► /tf: odom→base_link
+
+/livox/lidar/synced/deskewed
+  └─ rtabmap ICP 오도메트리 ──────────────────► /icp_odom (SLAM 전용, EKF 미연결)
 
 [SLAM 레이어]
 ─────────────────────────────────────────────────────────────────
@@ -142,8 +145,10 @@ EC25 모뎀 (2Hz)
 | `/livox/lidar/synced` | 20Hz | PointCloud2 | 타임스탬프 보정 |
 | `/livox/lidar/synced/deskewed` | 20Hz | PointCloud2 | 모션 보정 |
 | `/odom` | 50Hz | Odometry | 휠 오도메트리 |
-| `/icp_odom` | ~4Hz | Odometry | ICP 오도메트리 |
-| `/icp_odom_filtered` | ~4Hz | Odometry | 공분산 스케일 후 |
+| `/camera/camera/imu` | 200Hz | Imu | 원시 IMU |
+| `/camera/camera/imu_bias_corrected` | 200Hz | Imu | 3단계 보정 후 IMU |
+| `/camera/camera/imu_fixed` | 200Hz | Imu | Madgwick 필터 후 (EKF vyaw 입력) |
+| `/icp_odom` | ~4Hz | Odometry | ICP 오도메트리 (SLAM 전용, EKF 미연결) |
 | `/odometry/filtered` | 20Hz | Odometry | EKF 퓨전 결과 |
 | `/bunker_status` | 50Hz | BunkerStatus | 모터/엔코더 상태 |
 | `/cmd_vel` | 30Hz | Twist | 최종 모터 명령 |
@@ -182,7 +187,8 @@ EC25 모뎀 (2Hz)
 - **IMU 양자화 노이즈**: LSB = 0.00107 rad/s
   → 정지 시에도 0, ±0.00107, ±0.00214... 이산값 출력
   → 200Hz 적분 시 누적 드리프트 발생
-  → EKF에서 IMU vyaw 완전 비활성화
+  → **3단계 보정으로 극복** (초기 bias 제거 + EMA 연속추적 + 정지 yaw 강제 0 & cov 게이팅)
+  → EKF에서 imu0 vyaw=true 활성화 (v2, 2026-03-09~)
 
 #### Bunker 모터/엔코더
 - **프로토콜**: CAN 버스 (can1, 500kbps)
@@ -277,32 +283,119 @@ python3 ~/ca_ws/tools/lidar_camera_sync_probe.py \
 
 ---
 
-### 4.4 camera_imu_pipeline_cpp (C++)
+### 4.4 camera_imu_pipeline_cpp (C++) — **3단계 바이어스 보정 (v2 핵심 변경)**
 
 **경로**: `src/camera_imu_pipeline_cpp/`
 
 #### 역할
 RealSense D455 IMU의 바이어스 보정 및 Madgwick 필터를 통한 자세 추정.
+**v2 (2026-03-09~)**: ICP odometry를 EKF에서 제거하고, 카메라 IMU vyaw를 EKF 회전 추종의 **주 입력**으로 전환. 이를 위해 보정 단계를 3단계로 강화.
 
-#### camera_imu_bias_corrector.cpp
+#### 전환 배경: 왜 ICP에서 Camera IMU로 돌아왔나
 
-**바이어스 보정 알고리즘**:
-1. 초기 정지 단계에서 1000 샘플 수집
-2. 평균값 계산 → 초기 바이어스 추정
-3. 이후 실시간 EMA (Exponential Moving Average, α=0.001)로 온도 드리프트 추적
-4. 보정된 IMU 데이터 발행
+```
+ICP 기반 아키텍처의 실패 모드 (plan.md v7~v8에서 발견):
+
+  icp_odom_cov_scale.py가 cmd_vel 기반으로 모드 판정
+    ↓
+  cmd_vel이 늦거나 없으면 CMD_TIMEOUT (0.5초)으로 STOP 전환
+    ↓
+  STOP 상태: angular.z = 0.0 강제 주입
+    ↓
+  회전 중인데도 EKF에 vyaw=0 전달 → yaw=0 고정
+    ↓
+  odom→base_link yaw가 회전을 추적하지 못함
+
+근본 원인: 외부 신호(cmd_vel)에 의존하는 모드 판정의 취약성
+해결: IMU 자체 신호(wx/wy/wz + accel)만으로 정지/이동 구분 → 외부 의존 제거
+```
+
+#### camera_imu_bias_corrector.cpp — 3단계 보정 구조
+
+IMU 측정 모델: `w_meas = w_true + bias + noise`
+
+**Stage 1: 초기 bias 캘리브레이션 (line 115~135)**
 
 ```cpp
-// 초기 캘리브레이션
-if (calib_count < 1000) {
-    bias_x += gyro.x; bias_y += gyro.y; bias_z += gyro.z;
-    calib_count++;
-} else {
-    // 실시간 EMA 업데이트
-    bias_x = 0.001 * gyro.x + 0.999 * bias_x;
+// 정지 상태(|angular_velocity| < stationary_threshold) 샘플만 수집
+// calib_samples(=1000)개 모아 평균값 → bias 확정
+if (!bias_ready_ && tf_ok && mag < stationary_threshold_) {
+    sum_x_ += av.x; sum_y_ += av.y; sum_z_ += av.z;
+    count_++;
+    if (count_ >= calib_samples_) {
+        bias_x_ = sum_x_ / count_;
+        bias_y_ = sum_y_ / count_;
+        bias_z_ = sum_z_ / count_;
+        bias_ready_ = true;
+    }
 }
-corrected.z = gyro.z - bias_z;
 ```
+
+- `publish_during_calib=false` → 교정 완료 전 노이즈 데이터가 EKF에 입력되지 않음
+- `calib_samples=1000` (200Hz에서 약 5초)
+- target_frame TF 미확보 시 누적 보류 (잘못된 좌표계 기준 bias 방지)
+
+**Stage 2: EMA 연속 bias 추적 (line 137~142)**
+
+```cpp
+// 초기 교정 후, 정지 구간에서 EMA로 bias 지속 업데이트
+if (continuous_calib_ && mag < stationary_threshold_) {
+    bias_x_ = (1.0 - ema_alpha_) * bias_x_ + ema_alpha_ * av.x;
+    bias_y_ = (1.0 - ema_alpha_) * bias_y_ + ema_alpha_ * av.y;
+    bias_z_ = (1.0 - ema_alpha_) * bias_z_ + ema_alpha_ * av.z;
+}
+```
+
+- `ema_alpha=0.001` → 시정수 ≈ 1000스텝 ≈ 5초(200Hz) ~ 20초(50Hz)
+- 목적: 온도 변화에 의한 bias 드리프트 보상
+- 조건: 정지 상태에서만 업데이트 (이동 중 실제 회전이 bias로 학습되는 것 방지)
+
+**Stage 3: 정지 yaw 강제 0 + 공분산 게이팅 (line 177~204)**
+
+```cpp
+// 3가지 조건 모두 참일 때만 정지로 판정
+const bool low_yaw_rate = std::fabs(wz) < yaw_zero_threshold_;         // 0.03 rad/s
+const bool low_roll_pitch_rate =
+    std::fabs(wx) < gyro_xy_stationary_threshold_ &&                    // 0.05 rad/s
+    std::fabs(wy) < gyro_xy_stationary_threshold_;
+const bool accel_near_g =
+    std::fabs(acc_norm - gravity_mps2_) < accel_stationary_threshold_;  // ±0.7 m/s²
+
+yaw_clamped = low_yaw_rate && low_roll_pitch_rate && accel_near_g;
+if (yaw_clamped) {
+    out.angular_velocity.z = 0.0;  // hard zero
+}
+
+// 공분산 분리: 정지→EKF가 0을 강하게 신뢰, 이동→적절한 불확실성
+const double yaw_cov = yaw_clamped ? yaw_stationary_cov_ : yaw_moving_cov_;
+// yaw_stationary_cov = 1e-4 (매우 작음 → EKF가 vyaw=0을 확신)
+// yaw_moving_cov = 0.1 (적절한 불확실성 → IMU 측정값 활용)
+out.angular_velocity_covariance[8] = yaw_cov;  // z축 공분산
+```
+
+**정지 판정이 ICP cov_scale보다 나은 이유:**
+
+| 비교 항목 | ICP cov_scale (구) | IMU 3단계 (현재) |
+|-----------|-------------------|-----------------|
+| 정지 판정 소스 | `/cmd_vel` (외부 신호) | IMU 자체 (wx/wy/wz + accel) |
+| 실패 모드 | cmd_vel 지연/누락 → STOP 오판 | IMU가 동작하는 한 정상 |
+| 회전 중 보호 | cmd_vel이 없으면 STOP → vyaw=0 강제 | accel ≠ g → 이동 판정 유지 |
+| 정지 감지 속도 | 0.5초 타임아웃 의존 | 즉시 (매 IMU 샘플) |
+
+#### 파라미터 요약
+
+| 파라미터 | 기본값 | 단계 | 역할 |
+|---------|--------|------|------|
+| `calib_samples` | 1000 | Stage 1 | 초기 평균 샘플 수 |
+| `stationary_threshold` | 0.01 rad/s | Stage 1,2 | 정지 판정 (캘리브레이션용) |
+| `continuous_calib` | true | Stage 2 | EMA 연속 추적 활성화 |
+| `ema_alpha` | 0.001 | Stage 2 | EMA 가중치 |
+| `yaw_zeroing_enable` | true | Stage 3 | yaw 강제 0 활성화 |
+| `yaw_zero_threshold` | 0.03 rad/s | Stage 3 | \|wz\| 정지 기준 |
+| `gyro_xy_stationary_threshold` | 0.05 rad/s | Stage 3 | \|wx\|,\|wy\| 정지 기준 |
+| `accel_stationary_threshold` | 0.7 m/s² | Stage 3 | \|\|a\|\|-g 정지 기준 |
+| `yaw_stationary_cov` | 1e-4 | Stage 3 | 정지 시 z축 공분산 |
+| `yaw_moving_cov` | 0.1 | Stage 3 | 이동 시 z축 공분산 |
 
 #### imu_filter_madgwick
 
@@ -310,66 +403,96 @@ corrected.z = gyro.z - bias_z;
 - 출력: `/camera/camera/imu_fixed` (쿼터니언 자세 + 각속도)
 - `zeta: 0.0` → 자이로 드리프트 보정 비활성화 (원시 각속도 보존 목적)
 
-#### IMU 한계 (EKF에서 비활성화한 이유)
+#### IMU 양자화 한계와 3단계 보정의 관계
+
 ```
-LSB = 0.00107 rad/s
-200Hz 적분 → 200 × 0.00107 = 0.214 rad/s 최대 양자화 오차
-30초 적분 → 최대 6.4 rad (360° 이상) 누적 가능
-정지 중에도 ±0.00107, ±0.00214 이산값 출력 → TF 진동 발생
+양자화 문제 (LSB = 0.00107 rad/s):
+  정지 시 출력: 0, ±0.00107, ±0.00214... 이산값
+  200Hz 적분 → 30초 → 최대 6.4 rad (360°) 누적 가능
+
+3단계 보정이 양자화를 극복하는 원리:
+  Stage 1: 평균 bias 제거 → 정지 시 잔차 = 순수 양자화 노이즈 (±0.001 수준)
+  Stage 2: EMA가 잔차의 DC 성분도 추적 → 잔차 더 감소
+  Stage 3: |wz| < 0.03 이면 wz=0 강제 + cov=1e-4
+           → 양자화 잔차(±0.001)는 threshold(0.03)보다 훨씬 작으므로
+           → 정지 시 반드시 wz=0으로 고정됨 → 적분 드리프트 완전 차단
+
+  이동 시: bias 제거된 측정값을 cov=0.1로 EKF에 전달
+           → EKF가 적절한 불확실성으로 yaw rate 추적
 ```
 
 ---
 
-### 4.5 robot_localization (EKF 센서 퓨전)
+### 4.5 robot_localization (EKF 센서 퓨전) — **v2: 휠 vx + Camera IMU vyaw**
 
 **경로**: `src/robot_localization/`, **설정**: `src/robot_localization/params/ekf.yaml`
 
 #### 역할
-확장 칼만 필터(EKF)로 휠 오도메트리와 ICP 오도메트리를 퓨전.
+확장 칼만 필터(EKF)로 휠 오도메트리(vx)와 카메라 IMU(vyaw)를 퓨전.
 
-#### 입력 구성
+#### v1→v2 아키텍처 전환
+
+```
+v1 (ICP 기반, ~2026-03-06):
+  odom0: /odom          (vx=true)
+  odom1: /icp_odom_filtered (vyaw=true)  ← icp_odom_cov_scale.py 경유
+  imu0:  비활성화
+
+v2 (Camera IMU 기반, 2026-03-09~):
+  odom0: /odom          (vx=true)
+  imu0:  /camera/camera/imu_fixed (vyaw=true)  ← 3단계 보정 후
+  odom1: 제거 (ICP는 EKF에 연결하지 않음)
+```
+
+#### 현재 입력 구성
 
 ```yaml
 # 휠 오도메트리 (50Hz) - vx만 활성화
 odom0: /odom
 odom0_config: [false, false, false,   # x, y, z 위치
                false, false, false,   # roll, pitch, yaw
-               true,  false, false,   # vx, vy, vz  ← 이것만 활성화
-               false, false, false,   # vroll, vpitch, vyaw
+               true,  false, false,   # vx ← 이것만 활성화
+               false, false, false,   # vroll, vpitch, vyaw (휠 vyaw는 슬립으로 비활성화)
                false, false, false]   # ax, ay, az
-odom0_queue_size: 10
-odom0_differential: false
 
-# ICP LiDAR 오도메트리 (~4Hz) - vyaw만 활성화
-odom1: /icp_odom_filtered
-odom1_config: [false, false, false,
-               false, false, false,
-               false, false, false,
-               false, false, true,    # vyaw만 활성화
-               false, false, false]
-odom1_queue_size: 10
-
-# IMU - 전부 비활성화 (양자화 노이즈)
+# 카메라 IMU (200Hz, 3단계 보정 후) - vyaw만 활성화
 imu0: /camera/camera/imu_fixed
-imu0_config: [false × 15]
+imu0_config: [false, false, false,
+              false, false, false,    # yaw 절대값은 사용 안 함
+              false, false, false,
+              false, false, true,     # vyaw ← 3단계 보정된 yaw rate가 주 회전 입력
+              false, false, false]
+imu0_queue_size: 200
+imu0_twist_rejection_threshold: 1.5   # 비정상 스파이크 차단 (rad/s)
 ```
 
 #### 출력
-- `/odometry/filtered` — 20Hz, 퓨전된 (vx, wz) 상태
+- `/odometry/filtered` — 20Hz, 퓨전된 (vx, vyaw) 상태
 - `/tf: odom → base_link` — 20Hz TF
 
-#### 설계 철학
+#### 설계 철학 (v2)
 
 ```
 문제: 단일 센서로는 정확한 yaw 추정 불가
   - 휠 오도메트리: 슬립 → yaw 오차
-  - IMU: 양자화 노이즈 → 적분 드리프트
-  - ICP 단독: 빠른 갱신 불가
+  - IMU (보정 전): 양자화 노이즈 → 적분 드리프트
+  - ICP: cmd_vel 의존 모드 판정 → STOP 오판 시 yaw 고정
 
-해결: 이중 소스 분리 퓨전
-  - vx 소스: 휠 엔코더 (슬립 영향 작음)
-  - vyaw 소스: LiDAR ICP (슬립/양자화 무관)
-  - EKF: 두 소스를 최적 결합 → 정확한 전체 상태
+해결: 휠 vx + IMU 3단계 보정 vyaw
+  - vx 소스: 휠 엔코더 (슬립 영향 작음, 50Hz 고주파)
+  - vyaw 소스: Camera IMU (3단계 보정으로 양자화 극복, 200Hz 초고주파)
+  - 핵심: IMU 양자화 한계를 보정 레이어에서 해결 → EKF는 깨끗한 vyaw 수신
+  - 장점: ICP(~4Hz) 대비 200Hz로 훨씬 빠른 yaw 갱신 → 빠른 회전에도 추적
+```
+
+#### 주요 파라미터
+
+```yaml
+frequency: 20.0                    # EKF 출력 주기
+sensor_timeout: 0.2                # 센서 타임아웃
+two_d_mode: true                   # 2D 평면 주행 (z, roll, pitch 고정)
+predict_to_current_time: false     # 잔류 각속도 추가 적분 방지
+publish_tf: true                   # odom→base_link TF 발행
 ```
 
 ---
@@ -467,32 +590,23 @@ odom_args = (
 → `/livox/lidar/static_filtered` (동적 객체 제거 후)가 아닌 이유:
 → static_filtered는 RTAB-Map 출력 의존 → 데드락(순환 의존) 가능성
 
-#### 4.6.4 scripts/icp_odom_cov_scale.py
+#### 4.6.4 scripts/icp_odom_cov_scale.py — ⚠️ v2에서 EKF 미연결 (레거시)
 
-ICP vyaw 공분산 동적 조정 스크립트.
+> **v2 (2026-03-09~):** EKF yaml에서 `odom1`(ICP)이 제거됨. 이 스크립트 파일은 존재하지만 EKF와 연결되지 않는다. RTAB-Map이 `/icp_odom`을 SLAM 전용으로 사용할 수 있으나, odom→base_link yaw 추적과는 무관.
+
+**v1 당시 동작 (참조용):**
 
 ```python
-# 구독
-/cmd_vel (Twist) → 현재 운동 상태 파악
-/icp_odom (Odometry) → ICP 출력 수신
-
-# 상태별 SCALE 적용
-if abs(v) < 0.01 and abs(w) < 0.01:  # 정지
-    SCALE = 1000  # ICP vyaw 사실상 무시 → 드리프트 방지
-elif abs(w) >= 0.01:                  # 회전
-    SCALE = 1     # ICP PointToPlane 완전 신뢰
-else:                                 # 전진
-    SCALE = 10    # vyaw 부분 신뢰
-
-cov_out[35] = cov_in[35] * SCALE
-publish(/icp_odom_filtered)
+# cmd_vel 기반 모드 판정
+STOP:  |v|<0.01, |w|<0.01 또는 cmd_vel 0.5초 타임아웃 → vyaw=0 강제 + cov=0.001
+ROT:   |w|>=0.01                                      → cov[35] × 1
+TRANS: |v|>=0.01                                      → cov[35] × 10
 ```
 
-**설계 이유**:
-- 정지 시 ICP는 동일 스캔 → vyaw ≈ 0이나 노이즈 존재 → EKF가 보정 시도 → 드리프트
-- SCALE=1000으로 곱하면 EKF 관측 불확실성이 커져 사실상 무시
-- 회전 시 SCALE=1 → ICP PointToPlane이 정확 → 완전 신뢰
-- RTAB-Map 자체 no-motion sentinel (cov[35]=9999) × SCALE=1000 = 9,999,000 → EKF가 절대 무시
+**폐기 이유 (plan.md v7~v8 진단):**
+- cmd_vel 지연/부재 시 CMD_TIMEOUT으로 STOP 오판
+- 회전 중인데도 vyaw=0 강제 → EKF yaw=0 고정
+- 외부 신호 의존(cmd_vel)이 근본적 취약점
 
 ---
 
@@ -746,7 +860,70 @@ check_radius: 0.25m
 
 ## 5. 핵심 알고리즘 심층 분석
 
-### 5.1 ICP Odometry & PointToPlane
+### 5.1 IMU 3단계 바이어스 보정 & EKF vyaw 전략 (v2 핵심)
+
+#### 전체 파이프라인
+
+```
+/camera/camera/imu (200Hz, raw)
+  ↓
+[Stage 1] 초기 bias 평균 제거 (1000 샘플)
+  ↓
+[Stage 2] EMA 연속 bias 추적 (α=0.001, 온도 드리프트 보상)
+  ↓
+[Stage 3] 정지 판정 → wz=0 강제 + cov=1e-4
+           이동 판정 → wz 그대로 + cov=0.1
+  ↓
+/camera/camera/imu_bias_corrected
+  ↓
+imu_filter_madgwick (자세 추정)
+  ↓
+/camera/camera/imu_fixed
+  ↓
+EKF (imu0, vyaw=true)
+  ↓
+/odometry/filtered → odom→base_link TF
+```
+
+#### Stage 3 정지 판정의 수학적 근거
+
+```
+정지 조건 (3가지 AND):
+  (1) |wz| < 0.03 rad/s     — yaw rate 작음
+  (2) |wx|, |wy| < 0.05     — roll/pitch rate 작음
+  (3) ||a|| ≈ g ± 0.7 m/s²  — 가속도가 중력만 (움직임 없음)
+
+왜 3조건인가:
+  - (1)만 쓰면: 저속 회전(~0.02 rad/s)을 STOP으로 오판 가능
+  - (3)을 추가: 이동 중이면 가속도가 g와 차이남 → 이동 판정 유지
+  - (2)를 추가: 차량이 기울어진 경사면에서 중력 성분이 xy에 분배될 때 정지 오판 방지
+
+EKF 관점:
+  정지 시: K = P·H^T / (H·P·H^T + 1e-4)
+    → K ≈ 1 → EKF가 vyaw=0을 거의 확정적으로 수용
+    → yaw 적분 즉시 중단 → 드리프트 없음
+
+  이동 시: K = P·H^T / (H·P·H^T + 0.1)
+    → K는 적절한 값 → IMU vyaw 측정에 비례하여 yaw 갱신
+    → bias 제거된 깨끗한 vyaw로 회전 추적
+```
+
+#### IMU vs ICP: 주파수 이점
+
+```
+ICP (v1):   ~4Hz → EKF 예측 250ms 동안 open-loop
+            빠른 회전(>1 rad/s) 시 예측 오차 누적
+
+IMU (v2):   200Hz → EKF 보정 5ms 간격
+            빠른 회전에도 실시간 추적
+            Stage 3 보정이 정지 드리프트 차단 → 주파수의 장점만 취함
+```
+
+---
+
+### 5.2 ICP Odometry & PointToPlane (SLAM 전용)
+
+> **v2 (2026-03-09~):** ICP odometry는 EKF에서 분리됨. RTAB-Map SLAM의 odom 소스 / 노드 등록용으로만 사용.
 
 #### F2F ICP 원리
 
@@ -763,8 +940,6 @@ ICP(Iterative Closest Point)는 두 포인트클라우드 간의 최적 변환(R
 ```
 
 #### PointToPlane ICP 개선
-
-기존 PointToPoint vs PointToPlane:
 
 ```
 PointToPoint:
@@ -786,84 +961,48 @@ Reg/Force3DoF: true
 → R = Rz(θ) (z축 회전만 허용)
 → t = [tx, ty, 0] (x, y 이동만 허용)
 → 평면 주행 로봇에 최적화
-
-vyaw = θ / dt
 ```
 
 ---
 
-### 5.2 EKF 이중 오도메트리 전략
+### 5.3 아키텍처 전환 이력: ICP→IMU (v1→v2)
 
-#### 단일 센서 한계
-
-```
-휠 오도메트리만:
-  vx: ±2% 오차 (저속에서 양호)
-  vyaw: 슬립 시 수십% 오차 → EKF yaw 발산
-
-IMU만:
-  LSB = 0.00107 rad/s
-  정지 시 ±0.00107, ±0.00214 이산값
-  → 200Hz × 30초 = 6,000 샘플 적분 → 최대 6.4 rad 오차
-
-ICP 단독:
-  4Hz 업데이트 → EKF 예측 후 보정 지연
-  빠른 회전 시 발산 가능
-```
-
-#### 이중 소스 퓨전 설계
+#### v1 아키텍처 (ICP 기반, ~2026-03-08)
 
 ```
-EKF 상태 벡터: [x, y, yaw, vx, vy, vyaw, ...]
-
-odom0 (휠, 50Hz):
-  관측: [vx]
-  공분산: 낮음 (엔코더 신뢰)
-  → x, y 추적에 기여
-  → vyaw에는 영향 없음
-
-odom1 (ICP, ~4Hz):
-  관측: [vyaw]
-  공분산: cmd_vel 상태에 따라 동적 조정
-  → yaw 추적에 기여
-  → vx에는 영향 없음
-
-결과: 슬립 없는 vx + 양자화 없는 vyaw
-     → 정확한 odom→base_link TF
+/odom(vx) + /icp_odom_filtered(vyaw) → EKF → odom→base_link TF
+                   ↑
+   icp_odom_cov_scale.py (cmd_vel 기반 모드 판정)
 ```
 
----
+**v1 실패 분석 (plan.md v7~v8):**
 
-### 5.3 icp_odom_cov_scale 동적 공분산 조정
+| 문제 | 원인 | 증상 |
+|------|------|------|
+| yaw=0 고정 | cmd_vel 부재 → CMD_TIMEOUT → STOP 오판 → vyaw=0 강제 | 회전 중 odom yaw 미추적 |
+| 외부 의존 | 모드 판정이 /cmd_vel에만 의존 | Nav2 경로 계획 지연 시 즉시 STOP |
+| 저주파 | ICP ~4Hz → 250ms open-loop | 빠른 회전 추적 불가 |
 
-#### 상태 머신
-
-```
-cmd_vel 모니터링:
-  - 마지막 cmd_vel 수신 후 0.5초 이상 경과 → STOP 상태
-  - |v| < 0.01 AND |w| < 0.01 → STOP 상태
-  - |w| >= 0.01 → ROTATE 상태
-  - |v| >= 0.01 → TRANSLATE 상태
-
-공분산 스케일 적용:
-  STOP:       cov[35] × 1000  → EKF가 ICP vyaw 무시
-  ROTATE:     cov[35] × 1     → ICP PointToPlane 완전 신뢰
-  TRANSLATE:  cov[35] × 10    → 부분 신뢰
+**실측 증거 (plan.md v8):**
+```bash
+ros2 run tf2_ros tf2_echo odom base_link
+→ yaw=0.000 고정  # 로봇이 회전 중인데도!
+→ x만 0.007 → 0.016으로 소폭 증가 (vx만 살아 있음)
 ```
 
-#### 수학적 의미
+#### v2 아키텍처 (Camera IMU 기반, 2026-03-09~)
 
-EKF Kalman 게인: `K = P·H^T / (H·P·H^T + R)`
-- R: 관측 노이즈 공분산 (= cov[35])
-- R 크면 → K 작음 → 관측 영향 적음
+```
+/odom(vx) + /camera/camera/imu_fixed(vyaw) → EKF → odom→base_link TF
+                          ↑
+   camera_imu_bias_corrector (3단계: bias제거 + EMA + 정지zero/cov게이팅)
+```
 
-SCALE=1000이면:
-```
-R_new = R_original × 1000
-K_new ≈ K_original / 1000
-혁신 항 기여: K × (z - h(x)) ≈ 0
-→ EKF가 이 관측을 사실상 무시
-```
+**v2의 설계 원칙:**
+1. **자체 신호만으로 판정**: IMU wx/wy/wz + accel로 정지/이동 구분 → 외부 의존 없음
+2. **고주파 갱신**: 200Hz → EKF 보정 간격 5ms → 빠른 회전 추적
+3. **양자화 극복**: 3단계 보정이 IMU의 근본 한계를 레이어에서 해결
+4. **단순성**: ICP + cov_scale + cmd_vel 3자 연쇄 의존 → IMU 단일 소스로 단순화
 
 ---
 
@@ -1093,12 +1232,12 @@ bunker_base에 publish_odom_tf=true:
 
 ## 7. 설정 파일 상세 분석
 
-### EKF 설정 (ekf.yaml)
+### EKF 설정 (ekf.yaml) — v2 현재 구성
 
 ```yaml
 # 핵심 설정
 frequency: 20.0
-sensor_timeout: 0.1
+sensor_timeout: 0.2
 two_d_mode: true  # 2D 주행 모드
 
 # 좌표계
@@ -1107,13 +1246,14 @@ odom_frame: odom
 base_link_frame: base_link
 world_frame: odom
 publish_tf: true
+predict_to_current_time: false  # 잔류 각속도 추가 적분 방지
 
-# 예측 모델
-process_noise_covariance: [...]  # 프로세스 노이즈 (Q 행렬)
-initial_estimate_covariance: [...]  # 초기 불확실성 (P0 행렬)
+# 입력 소스 (v2: 휠 vx + Camera IMU vyaw)
+odom0: /odom                         # 휠 오도메트리 → vx만
+imu0: /camera/camera/imu_fixed       # 3단계 보정 IMU → vyaw만
+imu0_twist_rejection_threshold: 1.5  # 비정상 스파이크 차단
 
-# 관측 모델 (odom0, odom1, imu0 구성 앞 절 참조)
-predict_to_current_time: false  # 현재 시간으로 외삽 비활성화
+# v1 대비 제거: odom1(/icp_odom_filtered) — ICP는 EKF에서 분리됨
 ```
 
 ### Nav2 파라미터 핵심 설정 (nav2_rtabmap_params.yaml)
@@ -1151,12 +1291,19 @@ controller_server:
 
 ## 8. 알려진 이슈 및 해결책
 
-### 8.1 IMU 양자화 노이즈 ✅ 해결됨
+### 8.1 IMU 양자화 노이즈 ✅ 해결됨 (v2 3단계 보정)
 
-**증상**: 정지 중에도 `odom→base_link` yaw가 미세하게 진동
-**원인**: RealSense IMU LSB=0.00107 rad/s → 이산 각속도 값
-**해결**: `imu0_config` 전부 false → IMU vyaw EKF 제외
-**상태**: 완전 해결
+**증상**: 정지 중에도 `odom→base_link` yaw가 미세하게 진동/드리프트
+**원인**: RealSense IMU LSB=0.00107 rad/s → 이산 각속도 값 → 적분 시 누적 오차
+
+**해결 이력**:
+- v1: `imu0_config` 전부 false → IMU 완전 비활성화 (ICP vyaw로 대체)
+- v2 (현재): **3단계 보정**으로 양자화 극복 → `imu0 vyaw=true` 재활성화
+  - Stage 1: 초기 bias 평균 제거 (1000 샘플)
+  - Stage 2: EMA 연속 추적 (α=0.001)
+  - Stage 3: 정지 시 wz=0 강제 + cov=1e-4 (양자화 잔차 < threshold → 정지 감지 성공)
+
+**상태**: 완전 해결 — 정지 드리프트 차단 확인
 
 ---
 
@@ -1164,12 +1311,35 @@ controller_server:
 
 **증상**: 곡선 주행 시 `odom→base_link` yaw가 실제와 달라짐
 **원인**: 바퀴 슬립 → 엔코더 오차 → yaw 누적
-**해결**: `odom0_config` vyaw=false + `odom1_config` vyaw=true (ICP)
+
+**해결 이력**:
+- v1: `odom0_config` vyaw=false + `odom1(ICP)` vyaw=true
+- v2 (현재): `odom0_config` vyaw=false + `imu0` vyaw=true (카메라 IMU)
+- 공통: 휠 vyaw는 슬립으로 신뢰 불가 → 항상 비활성화
+
 **상태**: 완전 해결
 
 ---
 
-### 8.3 제자리 회전 시 맵 뒤틀림 ⚠️ 최근 수정 (재테스트 필요)
+### 8.3 ICP cov_scale STOP 오판으로 yaw 고정 ✅ 해결됨 (v2에서 ICP 제거)
+
+**증상**: 회전 중인데도 `odom→base_link` yaw=0 고정
+**원인**: `icp_odom_cov_scale.py`가 cmd_vel 부재 시 CMD_TIMEOUT → STOP 전환 → vyaw=0 강제
+
+**실측 (plan.md v8):**
+```bash
+ros2 run tf2_ros tf2_echo odom base_link → yaw=0.000 고정
+ros2 run tf2_ros tf2_echo map odom → yaw=0.000, identity
+```
+
+**해결**: v2에서 EKF `odom1`(ICP) 제거 → Camera IMU 3단계 보정이 vyaw 제공
+- IMU는 자체 신호(wx/wy/wz + accel)로 정지/이동 판정 → cmd_vel 외부 의존 없음
+
+**상태**: 완전 해결
+
+---
+
+### 8.4 제자리 회전 시 맵 뒤틀림 ⚠️ 최근 수정 (재테스트 필요)
 
 **증상**: 제자리 360° 회전 후 맵이 실제 환경과 불일치
 **원인 분석**:
@@ -1189,7 +1359,7 @@ controller_server:
 
 ---
 
-### 8.4 g2o 옵티마이저 미사용 ⚠️ 진행 중
+### 8.5 g2o 옵티마이저 미사용 ⚠️ 진행 중
 
 **증상**: 시작 시 "g2o optimizer not available, TORO will be used" 경고
 **영향**: TORO는 g2o보다 느리고 정확도가 낮음
@@ -1198,7 +1368,7 @@ controller_server:
 
 ---
 
-### 8.5 GPS 퓨전 미완성 ⏸️ 보류
+### 8.6 GPS 퓨전 미완성 ⏸️ 보류
 
 **현재**: EC25 브리지 동작, `/gps/fix` 발행
 **필요**: `navsat_transform_node` + 전역 EKF 구성
@@ -1277,13 +1447,14 @@ python3 ~/ca_ws/tools/bunker_motor_probe.py
 
 ### 강점
 
-1. **이중 오도메트리 퓨전**
-   - 휠 슬립 + IMU 양자화 두 문제를 동시에 극복
-   - ICP PointToPlane → 회전 정확도 향상
+1. **IMU 3단계 바이어스 보정 (v2 핵심)**
+   - 초기 bias 제거 + EMA 연속추적 + 정지 yaw=0 강제 & cov 게이팅
+   - 외부 신호(cmd_vel) 의존 없이 IMU 자체로 정지/이동 판정
+   - 200Hz 고주파 갱신 → ICP(4Hz) 대비 50배 빠른 yaw 추적
 
-2. **동적 공분산 조정**
-   - 운동 상태에 따라 센서 신뢰도 자동 조정
-   - 정지 시 드리프트 완전 방지
+2. **단순한 센서 퓨전 구조**
+   - 휠 vx(50Hz) + Camera IMU vyaw(200Hz) = 2소스 EKF
+   - ICP + cov_scale + cmd_vel 3자 연쇄 의존 제거 → 실패 지점 최소화
 
 3. **실시간 RL PID 적응**
    - PPO 정책으로 환경/부하 변화에 자동 적응
@@ -1291,7 +1462,7 @@ python3 ~/ca_ws/tools/bunker_motor_probe.py
 
 4. **Robust 그래프 최적화**
    - Huber 비용함수로 ICP 오류 제약 하중 감소
-   - 맵 왜곡 최소화
+   - PointToPlane ICP로 SLAM 노드 등록 정확도 향상
 
 5. **좁은 통로 탈출**
    - costmap 클리어런스 측정으로 충돌 예방
@@ -1308,7 +1479,8 @@ python3 ~/ca_ws/tools/bunker_motor_probe.py
 3. **카메라 미활용**: RGB-D 카메라가 설치되어 있으나 SLAM에 비전 특징 미사용 (LiDAR만)
 4. **캘리브레이션 드리프트**: 센서 마운팅 오프셋이 고정값 → 진동/열팽창에 미반응
 5. **RL 모델 재학습 미자동화**: 환경 변화 시 수동 재학습 필요
-6. **제자리 회전 맵 안정성**: 최근 수정 후 충분한 실주행 검증 필요
+6. **제자리 회전 맵 안정성**: RTAB-Map 파라미터 수정 후 충분한 실주행 검증 필요
+7. **Stage 3 임계값 검증 필요**: `yaw_zero_threshold=0.03`이 저속 회전 종료 직후 수렴에 적합한지 실테스트 확인
 
 ---
 
@@ -1322,7 +1494,7 @@ python3 ~/ca_ws/tools/bunker_motor_probe.py
 | 센서 동기화 런치 | `src/rtabmap_ros/rtabmap_launch/launch/sensor_sync.launch.py` |
 | SLAM 런치 | `src/rtabmap_ros/rtabmap_launch/launch/rtabmap.launch.py` |
 | SLAM+Nav2 런치 | `src/rtabmap_ros/rtabmap_launch/launch/rtabmap_nav2.launch.py` |
-| ICP 공분산 스케일 | `src/rtabmap_ros/rtabmap_launch/scripts/icp_odom_cov_scale.py` |
+| ICP 공분산 스케일 (v1 레거시) | `src/rtabmap_ros/rtabmap_launch/scripts/icp_odom_cov_scale.py` |
 | RL PID 추론 | `src/rl_pid_training/rl_pid_training/run_pid_policy.py` |
 | RL PID 환경 | `src/rl_pid_training/rl_pid_training/rl_pid_env_real.py` |
 | RL PID 런치 | `src/rl_pid_training/launch/agent_pid.launch.py` |
@@ -1340,4 +1512,5 @@ python3 ~/ca_ws/tools/bunker_motor_probe.py
 
 ---
 
-*보고서 생성: 2026-03-09, Claude Code (claude-sonnet-4-6)*
+*보고서 생성: 2026-03-09, v2 업데이트: 2026-03-10 (ICP→IMU 3단계 보정 전환 반영)*
+*Claude Code (claude-sonnet-4-6, claude-opus-4-6)*

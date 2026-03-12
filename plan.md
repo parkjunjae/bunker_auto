@@ -2643,3 +2643,469 @@ ros2 run tf2_ros tf2_echo map odom
 
 *계획서 v10 갱신: 2026-03-09*
 *핵심: ICP 축을 제거하고 IMU+EKF 단일 축으로 단순화해 회전 추종 문제를 우선 해결한다.*
+
+---
+
+## #v11-observation — 주행 시작 시 TF 드리프트 + map/odom 180° 회전 (2026-03-10)
+
+### 관측된 증상 (RViz 스크린샷 기반)
+
+```
+증상 1: 주행 시작 직후 TF 위치가 이상한 곳으로 드리프트
+  - 목표 지점이 아닌 엉뚱한 방향으로 odom→base_link가 이동
+  - 주행 시작과 동시에 발생 (점진적이 아닌 즉시)
+
+증상 2: map/odom 프레임의 x축이 base_link와 반대 방향
+  - RViz에서 map, odom 프레임 축이 base_link 대비 180° 회전
+  - 이는 yaw가 π(180°) 오프셋을 갖고 있다는 의미
+  - 로봇이 전진하면 EKF는 후진으로 해석 → 위치 발산
+```
+
+---
+
+## #v11-diagnostic — Fix 1-1 진단 결과 (2026-03-10 실시)
+
+### A) RealSense IMU frame_id
+
+```
+ros2 topic echo /camera/camera/imu --field header.frame_id --once
+→ camera_imu_optical_frame
+
+참고: camera_gyro_optical_frame이 아니라 camera_imu_optical_frame이다.
+RealSense D455의 unite_imu_method 설정 시 통합 IMU 프레임 사용.
+```
+
+### B) 전체 TF 트리
+
+```
+ros2 run tf2_tools view_frames 결과:
+
+map (RTAB-Map, 20Hz)
+  └── odom (RTAB-Map, 20Hz)
+        └── base_link (EKF, 20Hz)
+              ├── livox_frame (static, sensor_sync)
+              ├── camera_link (static, sensor_sync, identity rotation)
+              │     ├── camera_gyro_frame (static, RealSense driver)
+              │     │     ├── camera_gyro_optical_frame (static, RealSense driver)
+              │     │     ├── camera_imu_frame (static, RealSense driver)
+              │     │     │     └── camera_imu_optical_frame (static, RealSense driver)
+              │     ├── camera_accel_frame → camera_accel_optical_frame
+              │     ├── camera_depth_frame → camera_depth_optical_frame
+              │     └── camera_color_frame → camera_color_optical_frame
+              └── gps_link (static)
+
+★ 핵심: RealSense 드라이버가 camera_link 이하 모든 내부 프레임 TF를 정상 발행 중.
+  TF 체인 끊김 없음.
+```
+
+### C) base_link → camera IMU 프레임 TF
+
+```
+ros2 run tf2_ros tf2_echo base_link camera_gyro_optical_frame
+ros2 run tf2_ros tf2_echo base_link camera_imu_optical_frame
+
+→ 두 프레임 모두 동일한 변환:
+  Translation: [0.284, -0.030, 0.557]
+  RPY (degree): [-90.000, 0.000, -90.000]
+  Matrix:
+    0.000  0.000  1.000  0.284
+   -1.000  0.000  0.000 -0.030
+    0.000 -1.000  0.000  0.557
+
+★ 이것은 표준 optical→REP103 변환이다:
+  optical (X=right, Y=down, Z=forward)
+  → base_link (X=forward, Y=left, Z=up)
+
+  변환 행렬 해석:
+    base_link_x = optical_z  (전방)
+    base_link_y = -optical_x (왼쪽)
+    base_link_z = -optical_y (위쪽)
+
+★ TF 체인 완전하고 변환 정확함.
+```
+
+### D) IMU angular_velocity.z 부호 테스트 (★ 가장 중요)
+
+```
+ros2 topic echo /camera/camera/imu_fixed --field angular_velocity.z
+로봇을 손으로 반시계(CCW) 회전:
+
+→ +0.80 ~ +0.95 rad/s (일관된 양수)
+
+★ 결과: 부호 정상 (ROS 오른손 법칙: CCW = +)
+  IMU 좌표 변환이 올바르게 작동하고 있음.
+```
+
+### E) EKF 출력 부호 테스트
+
+```
+ros2 topic echo /odometry/filtered --field twist.twist.angular.z
+같은 CCW 회전:
+
+→ +0.03 ~ +1.04 rad/s (양수, D와 일치)
+
+★ 결과: EKF vyaw 부호 정상. IMU→EKF 전달 경로에 부호 오류 없음.
+```
+
+### F) 현재 TF 상태
+
+```
+odom → base_link:
+  Translation: [0.435, -0.045, 0.000]
+  yaw = 0.934 rad (53.5°)  ← 정상 (로봇이 회전한 만큼)
+
+map → odom:
+  Translation: [0.000, 0.000, 0.000]
+  yaw = 0.000 rad (0°)     ← identity, 정상
+```
+
+---
+
+## v11-root-cause-analysis — 근본 원인 분석 (진단 결과 반영)
+
+### ~~원인 A (배제됨): 카메라 IMU 좌표계 ↔ base_link 좌표계 180° 불일치~~
+
+```
+★★★ 진단 결과: 원인 A는 해당 없음 ★★★
+
+근거:
+  1. TF 체인 완전: base_link → camera_link → ... → camera_imu_optical_frame ✓
+  2. RealSense 드라이버가 모든 내부 프레임 TF 정상 발행 ✓
+  3. camera_imu_bias_corrector.cpp의 TF lookup 성공 (has_tf=true) ✓
+  4. 변환 행렬: 표준 optical→REP103 회전 (-90°, 0°, -90°) ✓
+  5. CCW 회전 → imu_fixed vyaw = +양수 (부호 정상) ✓
+  6. CCW 회전 → EKF vyaw = +양수 (부호 정상, IMU와 일치) ✓
+
+  angular_velocity 변환 검증:
+    camera optical 프레임에서 CCW 회전:
+      optical wy_cam < 0 (Y=-아래 축 기준 반시계)
+    변환 후: base_link wz = -wy_cam > 0 (양수) ✓
+
+  → vyaw 부호 반전 가설 기각
+  → 축 매핑 오류 가설 기각
+  → 프레임 변환은 완벽하게 작동 중
+```
+
+### 원인 B (확인됨/최우선): IMU 캘리브레이션 지연 중 위치 드리프트
+
+```
+현재 설정:
+  publish_during_calib: false  ← 캘리브레이션 완료 전 IMU 미발행
+  calib_samples: 1000
+  stationary_threshold: 0.003 rad/s (매우 엄격)
+
+IMU 200Hz에서:
+  angular_velocity magnitude = sqrt(wx² + wy² + wz²)
+  양자화 노이즈: 각 축 ±0.00107 rad/s
+  → magnitude ≈ sqrt(3) × 0.00107 ≈ 0.00185 rad/s (정지 시)
+
+  stationary_threshold=0.003 → 대부분 통과하지만,
+  2축 이상에서 0.00214 발생 시 → magnitude > 0.003 → 샘플 거부
+  → 캘리브레이션 예상보다 오래 걸릴 수 있음 (5초 → 10~20초)
+
+문제:
+  캘리브레이션 동안 EKF에 vyaw 입력 없음
+  → odom0(wheel vx) 만으로 동작
+  → yaw = 0 고정 상태에서 vx가 적분됨
+  → 로봇이 이 시간에 회전하면 → vx가 잘못된 방향으로 적분 → 위치 발산
+
+시간선:
+  t=0s: 시스템 시작, IMU 캘리브레이션 시작
+  t=0~5s: EKF에 vyaw 없음 → yaw=0 고정
+  t=5s+: 캘리브레이션 완료, IMU 발행 시작
+  → 이미 yaw가 틀어진 상태에서 IMU가 시작 → 복구 어려움
+```
+
+### 원인 C (신규): RTAB-Map map→odom 점프에 의한 일시적 180° 관측
+
+```
+진단 결과에서 현재 map→odom = identity (정상) 이지만,
+사용자가 관측한 180° 회전은 특정 시점에서 발생했을 수 있다.
+
+가능한 메커니즘:
+  1. RTAB-Map 그래프 최적화 점프:
+     - 루프 클로저 감지 시 map→odom을 한 번에 크게 보정
+     - 잘못된 루프 클로저(false positive) → 180° 보정 가능
+     - Rtabmap/LoopThr=0.50으로 강화했지만, 시각 특징이 비슷한 반대편에서 매칭 가능
+
+  2. ICP 등록 ambiguity:
+     - 대칭 환경(복도, 빈 방)에서 ICP PointToPlane이 180° 회전 해를 찾을 수 있음
+     - 특히 제자리 회전 후 비슷한 스캔이 반대 방향으로 매칭
+
+  3. IMU 캘리브레이션 지연 + 초기 주행 복합 효과:
+     - t=0~5s: IMU 없이 yaw=0 고정
+     - 이 시간에 약간 회전 → EKF yaw 오차 발생
+     - RTAB-Map이 이 틀어진 odom을 기준으로 map 생성
+     - 이후 IMU 활성화 → EKF yaw 급격히 보정
+     - RTAB-Map이 map→odom을 반대로 보정하면서 축 반전 관측
+
+  재현 조건:
+     - 시스템 시작 직후 (IMU 캘리브레이션 미완료 상태)
+     - 주행 시작 + 회전 동작
+     - RTAB-Map이 첫 루프 클로저/그래프 최적화 실행 시
+```
+
+### 원인 D (신규): 시작 직후 wheel odom 초기 스파이크
+
+```
+관찰: 증상 1이 "주행 시작 직후" 즉시 발생
+
+EKF가 vyaw 없이 vx만으로 동작하는 상황에서:
+  - EKF 내부 yaw 상태 = 0 (초기값)
+  - 로봇이 약간이라도 틀어진 상태로 전진 시작
+  - vx는 base_link 기준이지만 yaw=0이면 odom에서 +X 방향으로만 적분
+  - 실제 로봇은 다른 방향으로 이동 → odom 위치 즉시 발산
+
+이것은 "180° 회전"이 아니라:
+  yaw=0 고정 상태에서 전진 → odom 위치가 엉뚱한 곳으로 이동
+  → RViz에서 "드리프트"로 관측
+
+180° 관측은 이후 RTAB-Map이 map→odom을 보정하면서 발생했을 수 있음.
+```
+
+---
+
+## #v11-fix — 해결 방안 (우선순위 재정렬 — 진단 결과 반영)
+
+### Fix 1 (최우선, 즉시 적용): IMU 캘리브레이션 중 EKF 보호
+
+> 원인 A(프레임 불일치)가 배제되었으므로, IMU 캘리브레이션 지연이 최우선 수정 대상.
+
+#### 1-1. publish_during_calib 전략 변경
+
+```python
+# sensor_sync.launch.py
+'publish_during_calib': True,   # False → True로 변경
+```
+
+**왜 이것이 핵심인가:**
+
+```
+현재(False):
+  t=0~5s: EKF에 IMU 데이터 없음
+  → EKF 상태: yaw=0 고정, vx만 적분
+  → 로봇이 약간이라도 틀어져 있으면 → odom 위치 즉시 발산
+
+변경 후(True):
+  t=0s~: IMU 데이터가 즉시 EKF에 전달 (bias 미보정이지만)
+  → bias 미보정 상태의 IMU vyaw는 ±0.001~0.003 rad/s 수준의 노이즈
+  → 이 노이즈는 Stage 3(yaw zeroing)에 의해 대부분 0으로 클램핑됨
+    (|wz| < 0.03 threshold 이내이므로)
+  → 정지 시: vyaw=0, cov=1e-4 → EKF yaw 안정 ✓
+  → 이동 시: bias 미보정 vyaw가 전달되지만, 대략적 방향은 추종 가능
+
+안전성 분석:
+  Stage 3 yaw zeroing은 bias_ready 여부와 무관하게 항상 동작
+  (camera_imu_bias_corrector.cpp line 178: yaw_zeroing_enable_ 플래그만 확인)
+  → bias 미보정 상태에서도 정지 시 yaw drift 보호 유지 ✓
+
+  bias 미보정 시 이동 중 vyaw 정확도:
+    raw_vyaw = true_vyaw + bias (~0.001 rad/s)
+    bias 오차는 매우 작으므로 대략적 yaw 추종에 충분
+    → 5초 후 bias 교정 완료되면 정확한 vyaw로 전환
+
+결론: publish_during_calib=True는 정확도 약간 감소 vs 시작 시 완전 발산 방지
+     → 명백히 True가 올바른 설정
+```
+
+#### 1-2. stationary_threshold 완화
+
+```python
+# sensor_sync.launch.py
+'stationary_threshold': 0.01,   # 0.003 → 0.01로 변경
+```
+
+**상세 근거:**
+
+```
+IMU 양자화 분석:
+  LSB = 0.00107 rad/s
+  3축 magnitude = sqrt(wx² + wy² + wz²)
+
+  정지 시 worst case (각 축 ±2 LSB):
+    magnitude = sqrt(3 × (0.00214)²) ≈ 0.0037 rad/s
+    → 현재 threshold(0.003)보다 크므로 이 샘플은 거부됨!
+
+  threshold=0.003 문제:
+    - 양자화 노이즈 피크(0.0037)보다 작음
+    - 미세 진동(테이블, 모터 진동)으로 쉽게 초과
+    - 샘플 거부율 증가 → 캘리브레이션 5초 → 10~20초 지연
+
+  threshold=0.01 개선:
+    - 양자화 노이즈 피크(0.0037)보다 충분히 큼
+    - 미세 진동에도 대부분 샘플 통과
+    - bias 정확도: threshold 이내의 동적 잔차만 포함
+      → 0.01 rad/s 이내의 오차는 Stage 2(EMA)가 수초 내 추적
+    - 캘리브레이션 1000 샘플 / 200Hz = 5초 확정적 완료
+```
+
+#### 1-3. EKF frequency 복원
+
+```yaml
+# ekf.yaml
+frequency: 50.0   # 20.0 → 50.0
+```
+
+**상세 근거:**
+
+```
+현재 20Hz 문제:
+  - EKF 예측 구간 = 50ms (= 1/20Hz)
+  - 이 50ms 동안 측정 보정 없이 상태 예측만 진행
+  - 회전 중: 50ms × 1 rad/s = 0.05 rad (2.9°) 오차 누적 가능
+  - TF 발행 간격 50ms → RTAB-Map/deskewing의 TF 보간 정밀도 저하
+
+  IMU 200Hz vs EKF 20Hz:
+    - IMU가 10개 샘플을 보내는 동안 EKF는 1회만 보정
+    - 나머지 9개 IMU 샘플은 큐에 쌓였다가 한 번에 처리
+    - robot_localization은 큐에 쌓인 측정을 순서대로 처리하지만,
+      예측-보정 간격이 넓으면 비선형성에 의한 오차 증가
+
+50Hz 변경 시:
+  - EKF 예측 구간 = 20ms
+  - 회전 중 오차: 20ms × 1 rad/s = 0.02 rad (1.1°) → 60% 감소
+  - TF 발행 간격 20ms → 보간 정밀도 2.5배 향상
+  - CPU 부하: 20Hz → 50Hz (2.5배) — Jetson에서 EKF는 경량이므로 무시 가능
+
+  Jetson Orin에서 EKF 50Hz CPU 예상:
+    robot_localization EKF (2D, 2 sensor) ≈ 1~2% CPU @ 50Hz
+    → 문제 없음
+```
+
+---
+
+### Fix 2 (권장): RTAB-Map 초기 방향 안정화
+
+```
+문제 시나리오:
+  1. IMU 캘리브레이션 지연 중 EKF yaw 오차 발생 (Fix 1로 대부분 해결)
+  2. 하지만 RTAB-Map은 EKF가 불안정한 초기 5~15초에도 스캔 수집 시작
+  3. 초기 스캔의 odom 포즈에 yaw 오차 포함
+  4. RTAB-Map이 이 포즈를 기준으로 map 원점 설정
+  5. 이후 EKF yaw 보정 → RTAB-Map이 map→odom 점프로 보상
+  6. 점프가 크면 → map/odom TF가 base_link와 크게 다른 방향
+
+방어 방안 1: rtabmap_nav2.launch.py의 TimerAction 활용
+  현재: nav2_server_nodes는 5초 딜레이, lifecycle_manager는 15초 딜레이
+  RTAB-Map(rtabmap.launch.py)은 즉시 시작 ← 문제!
+
+  → rtabmap_launch도 TimerAction으로 10초 지연 추가:
+    IMU 캘리브레이션(5초) + EKF 안정화(5초) 후 SLAM 시작
+
+방어 방안 2: RTAB-Map delete_db_on_start=true 시 초기 스캔 품질 보장
+  → RTAB-Map의 Rtabmap/StartNewMapOnLoopClosure=true 비활성화 확인
+  → 초기 수 프레임의 odom 품질이 낮으면 RTAB-Map에 부정적 영향
+
+방어 방안 3: 운용 절차
+  → 시스템 시작 후 최소 10초 정지 대기
+  → IMU 캘리브레이션 완료 + EKF 안정화 확인 후 주행 시작
+```
+
+---
+
+### Fix 3 (참고): Camera IMU 프레임 — 진단 완료, 수정 불필요
+
+```
+★ Fix 1-1 진단 결과 전체가 정상이므로 프레임 관련 수정은 불필요.
+
+확인된 사항:
+  - IMU frame_id: camera_imu_optical_frame ✓
+  - TF 체인: base_link → camera_link → camera_gyro_frame → camera_imu_frame
+              → camera_imu_optical_frame (완전) ✓
+  - 변환: RPY (-90°, 0°, -90°) = 표준 optical→REP103 ✓
+  - vyaw 부호: CCW → 양수 (정상) ✓
+  - EKF 부호: CCW → 양수, IMU와 일치 ✓
+
+  → camera_imu_bias_corrector.cpp의 TF lookup이 정상 동작
+  → sensor_sync.launch.py의 camera_link static TF(identity)는 올바름
+    (RealSense 드라이버가 내부 프레임 회전을 처리하므로)
+  → 부호 반전 수정 불필요
+  → static TF 회전 추가 불필요
+```
+
+---
+
+## #v11-verification — 검증 절차 (진단 결과 반영)
+
+```bash
+# === Phase 1: 수정 적용 ===
+# sensor_sync.launch.py:
+#   publish_during_calib: False → True
+#   stationary_threshold: 0.003 → 0.01
+# ekf.yaml:
+#   frequency: 20.0 → 50.0
+
+# === Phase 2: 정적 검증 (시작 후 정지 상태) ===
+
+# 1) IMU 캘리브레이션 즉시 시작 확인
+ros2 topic echo /camera/camera/imu_bias_corrected --field angular_velocity.z
+# → t=0s부터 데이터 수신 확인 (publish_during_calib=True)
+
+# 2) 캘리브레이션 완료 시간 확인 (로그)
+# "IMU bias calibrated" 로그가 5초 내 출력되는지 확인
+
+# 3) 정지 시 yaw zeroing 동작 확인
+ros2 topic echo /camera/camera/imu_bias_corrected --field angular_velocity.z
+# → 정지 시 0.0 출력 (Stage 3 yaw zeroing)
+
+# 4) TF 방향 확인
+ros2 run tf2_ros tf2_echo odom base_link
+ros2 run tf2_ros tf2_echo map odom
+# → 두 TF 모두 yaw ≈ 0 (초기 정렬)
+# → map→odom이 identity에 가까워야 함
+
+# === Phase 3: 주행 검증 ===
+# 1) 10초 정지 대기 후 직진 2m
+#    → odom x가 +2m 증가 확인 (전방으로 이동)
+# 2) 90° CCW 회전
+#    → odom yaw가 +1.57 rad 변화 확인
+# 3) 직진 2m
+#    → odom y가 +2m 증가 확인 (90° 회전 후이므로)
+# 4) 정지
+#    → map→odom이 크게 변하지 않음 확인
+
+# === Phase 4: 스트레스 테스트 ===
+# 1) 시스템 시작 후 즉시 주행 (정지 대기 없이)
+#    → 이전에 발생하던 드리프트가 해소되었는지 확인
+# 2) 360° 제자리 회전
+#    → map→odom yaw 변화량 < 0.1 rad 확인
+```
+
+성공 기준:
+
+1. 시스템 시작 즉시(t=0s) IMU 데이터가 EKF에 도달한다. (`publish_during_calib=True`)
+2. 캘리브레이션이 5초 내 완료된다. (`stationary_threshold=0.01`)
+3. 정지 시 yaw zeroing이 t=0s부터 동작한다. (Stage 3 독립 동작)
+4. 시작 직후 주행해도 odom→base_link가 올바른 방향으로 이동한다.
+5. RViz에서 map/odom/base_link 축이 같은 방향을 향한다.
+6. map→odom이 안정적이다 (큰 점프 없음).
+
+---
+
+## #v11-priority — 실행 순서 (진단 결과 반영)
+
+```
+★ 원인 A(프레임 불일치) 배제 → Fix 1(프레임 수정) 불필요
+★ 원인 B(캘리브레이션 지연) 확인 → 최우선 수정 대상
+
+1순위: Fix 1-1 (즉시 적용, 재빌드 불필요)
+  sensor_sync.launch.py:
+    publish_during_calib: False → True
+    stationary_threshold: 0.003 → 0.01
+
+2순위: Fix 1-3 (즉시 적용, 재빌드 불필요)
+  ekf.yaml:
+    frequency: 20.0 → 50.0
+
+3순위: Fix 2 (필요 시)
+  RTAB-Map 시작 지연 추가
+  운용 절차 수립 (시작 후 10초 정지 대기)
+
+이상 수정 후 Phase 2~4 검증 실행
+→ 180° 회전 재발 시 RTAB-Map 그래프 최적화 분석 (원인 C 추적)
+```
+
+---
+
+*계획서 v11 갱신: 2026-03-10 (진단 결과 반영)*
+*핵심 발견: IMU 프레임 변환은 완벽 정상 (부호/축 모두 올바름). 180° 회전의 근본 원인은 IMU 캘리브레이션 지연(publish_during_calib=False)으로 인한 시작 시 EKF yaw=0 고정 → vx 적분 방향 오류 → 위치 발산. 수정: publish_during_calib=True + stationary_threshold=0.01 + EKF 50Hz.*

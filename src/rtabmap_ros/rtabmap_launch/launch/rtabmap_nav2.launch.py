@@ -49,6 +49,10 @@ def generate_launch_description():
             'odom_topic': '/odometry/filtered',
             'odom_frame_id': 'odom',
             'map_frame_id': 'map',
+            # plan_v14:
+            # - RTAB-Map raw map->odom TF는 유지
+            # - 외부 stabilizer는 raw TF를 직접 listen
+            # - map_stable->map 상위 프레임만 추가한다
             'publish_tf_map': 'true',
             'visual_odometry': 'false',
             # IMU+EKF 기반으로 전환: RTAB-Map 내부 ICP odometry 비활성화
@@ -59,12 +63,13 @@ def generate_launch_description():
             'odom_log_level': 'error',  # Odometry 로그도 error 레벨로
             'qos': '2',  # BEST_EFFORT QoS for Nav2 compatibility
             'latch': 'false',  # VOLATILE durability for Nav2 compatibility
-            'topic_queue_size': '10',  # RGB-D subscriber queue (for delayed camera streams)
-            'sync_queue_size': '10',   # Approx sync queue size
+            'topic_queue_size': '3',  # RGB-D subscriber queue (for delayed camera streams)
+            'sync_queue_size': '3',   # Approx sync queue size
             # Let RTAB-Map sync RGB + Depth directly (more reliable than /camera/camera/rgbd)
             'approx_rgbd_sync': 'true',
-            'approx_sync_max_interval': '0.05',
+            'approx_sync_max_interval': '0.02',
             'rgbd_sync': 'true',
+            'wait_for_transform': '0.3',
             'subscribe_rgbd': 'false',
             'rgb_topic': '/camera/camera/color/image_raw',
             'depth_topic': '/camera/camera/aligned_depth_to_color/image_raw',
@@ -74,13 +79,96 @@ def generate_launch_description():
             'delete_db_on_start': delete_db_on_start,  # DB reset via ROS param
             # RTAB-Map(그래프/맵)에는 dynamic_filter 결과를 사용 (이동 물체 제거)
             'scan_cloud_topic': livox_deskewed_topic,
-            # icp_odometry에는 원본 deskewed 스캔 직접 사용
-            # (dynamic_filter는 odom TF 필요 → EKF 필요 → icp_odom 필요 → 데드락)
-            'icp_odom_scan_topic': livox_deskewed_topic,
-            # guess_frame_id를 비워 guess_from_tf 비활성화
-            # (odom TF가 없는 초기 상태에서 ICP 업데이트 abort 방지)
-            'odom_guess_frame_id': '',
         }.items()
+    )
+    map_tf_stabilizer_node = Node(
+        package='rtabmap_launch',
+        executable='map_tf_stabilizer.py',
+        name='map_tf_stabilizer',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'stable_map_frame_id': 'map_stable',
+            'map_frame_id': 'map',
+            'odom_frame_id': 'odom',
+            'imu_topic': '/camera/camera/imu_fixed',
+            'odom_topic': '/odometry/filtered',
+            'publish_hz': 20.0,
+            'tf_lookup_timeout_sec': 0.02,
+            # Raw spin evidence: IMU wz를 1차 근거로 사용하고,
+            # odom 선속도가 충분히 작을 때 pure spin score를 높인다.
+            'wz_filter_tau_sec': 0.06,
+            'speed_filter_tau_sec': 0.12,
+            'spin_wz_start': 0.08,
+            'spin_wz_full': 0.18,
+            'spin_speed_quiet': 0.05,
+            'spin_duration_ref_sec': 0.80,
+            'spin_yaw_ref_rad': 0.20,
+            'spin_decay_sec': 0.80,
+            'score_fast_weight': 0.75,
+            'score_slow_weight': 0.25,
+            'score_rise_tau_sec': 0.05,
+            'score_fall_tau_sec': 0.50,
+            # Correction authority:
+            # pure spin 중에도 gain을 0으로 닫지 않고, 빠르게 낮춘 뒤
+            # 느리게 회복시켜 jump 없이 복귀한다.
+            'gain_min': 0.20,
+            'gain_down_tau_sec': 0.06,
+            'gain_up_tau_sec': 1.20,
+            # map_stable->map 출력 변화율 자체를 제한해 fast spin 중
+            # map jump를 억제한다.
+            'out_yaw_rate_limit_normal': 0.80,
+            'out_yaw_rate_limit_spin': 0.20,
+            'out_pos_rate_limit_normal': 0.30,
+            'out_pos_rate_limit_spin': 0.06,
+            # Stable frame이 raw map에서 너무 멀어지지 않게 제한한다.
+            'yaw_lag_cap_normal': 0.40,
+            'yaw_lag_cap_spin': 0.20,
+            'pos_lag_cap_normal': 0.30,
+            'pos_lag_cap_spin': 0.08,
+            # Spin 종료 후 hidden debt를 한 번에 반영하지 말고
+            # map_stable->map을 천천히 identity로 되돌린다.
+            'recovery_tau_quiet_sec': 1.20,
+            'recovery_tau_spin_sec': 20.0,
+            'log_period_sec': 0.05,
+        }],
+    )
+    map_topic_stabilizer_node = Node(
+        package='rtabmap_launch',
+        executable='map_topic_stabilizer.py',
+        name='map_topic_stabilizer',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'input_map_topic': '/rtabmap/map',
+            'output_map_topic': '/rtabmap/map_stable',
+            'stable_map_frame_id': 'map_stable',
+            'imu_topic': '/camera/camera/imu_fixed',
+            'odom_topic': '/odometry/filtered',
+            'tick_hz': 20.0,
+            # TF stabilizer와 동일한 pure spin 창을 본다.
+            'wz_filter_tau_sec': 0.06,
+            'speed_filter_tau_sec': 0.12,
+            'spin_wz_start': 0.08,
+            'spin_wz_full': 0.18,
+            'spin_speed_quiet': 0.05,
+            'spin_duration_ref_sec': 0.80,
+            'spin_yaw_ref_rad': 0.20,
+            'spin_decay_sec': 0.80,
+            'score_fast_weight': 0.75,
+            'score_slow_weight': 0.25,
+            'score_rise_tau_sec': 0.05,
+            'score_fall_tau_sec': 0.50,
+            # pure spin 동안은 hold-last-good map을 유지하고,
+            # translation evidence가 다시 생길 때만 refresh한다.
+            'hold_enter_score': 0.55,
+            'hold_exit_score': 0.20,
+            'translation_release_speed': 0.06,
+            'translation_release_hold_sec': 0.30,
+            'refresh_settle_sec': 0.25,
+            'max_hold_sec': 4.0,
+            'log_period_sec': 0.05,
+        }],
     )
     livox_filter_node = Node(
         package='livox_pointcloud_filter',          # 필터 노드가 들어있는 패키지
@@ -240,6 +328,8 @@ def generate_launch_description():
         DeclareLaunchArgument('delete_db_on_start', default_value='true', description='Delete RTAB-Map database at startup'),
         DeclareLaunchArgument('database_path', default_value=os.path.expanduser('~/.ros/rtabmap_nav2.db'), description=''),
         rtabmap_launch,
+        map_tf_stabilizer_node,
+        map_topic_stabilizer_node,
         livox_filter_node,
         dynamic_filter_node,
         nav2_server_nodes,

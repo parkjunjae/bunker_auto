@@ -1,7 +1,7 @@
 bt_navigator:
   ros__parameters:
     use_sim_time: true
-    global_frame: map
+    global_frame: map_stable
     robot_base_frame: base_link
     odom_topic: /diff_drive_controller/odom # 가제보 학습용 오도메트리
     bt_loop_duration: 10
@@ -183,7 +183,7 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     assisted_teleop:
       plugin: "nav2_behaviors/AssistedTeleop"
-    global_frame: map
+    global_frame: map_stable
     robot_base_frame: base_link
     transform_tolerance: 0.2 # 2.0 → 0.2초로 변경
     simulate_ahead_time: 2.0
@@ -316,7 +316,7 @@ global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: true
-      global_frame: map
+      global_frame: map_stable
       robot_base_frame: base_link
       rolling_window: false
       resolution: 0.03
@@ -336,9 +336,9 @@ global_costmap:
       # ========================================================================
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
-        map_topic: /rtabmap/map
+        map_topic: /rtabmap/map_stable
         map_subscribe_transient_local: false
-        subscribe_to_updates: true
+        subscribe_to_updates: false
         enabled: true
         transform_tolerance: 0.2
 

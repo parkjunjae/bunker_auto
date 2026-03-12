@@ -10,6 +10,7 @@ install(DIRECTORY launch
 install(PROGRAMS 
    scripts/icp_odom_cov_scale.py
    scripts/map_tf_stabilizer.py
+   scripts/map_topic_stabilizer.py
    DESTINATION lib/${PROJECT_NAME}
 )
 

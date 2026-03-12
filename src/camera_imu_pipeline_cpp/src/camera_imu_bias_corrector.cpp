@@ -1,5 +1,7 @@
 #include <cmath>
+#include <limits>
 #include <memory>
+#include <string>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -33,18 +35,53 @@ public:
     ema_alpha_ = declare_parameter<double>("ema_alpha", 0.001);
 
     // 정지 구간 yaw drift 억제 파라미터
-    // - yaw_zeroing_enable: true면 정지로 판단될 때 angular_velocity.z를 0으로 고정
-    // - yaw_zero_threshold: |wz|가 이 값보다 작으면 정지 후보
-    // - gyro_xy_stationary_threshold: roll/pitch rate가 작아야 정지로 인정
-    // - accel_stationary_threshold: | |a|-g |가 작아야 정지로 인정
-    // - yaw_stationary_cov: 정지 고정 시 z축 공분산(작을수록 EKF가 0을 더 신뢰)
-    // - yaw_moving_cov: 비정지 시 z축 공분산
+    // 기존 threshold는 하위 호환용 기본값으로 남겨 두고,
+    // 실제 제어는 LOCK enter/exit 상태기계 파라미터로 수행한다.
+    // - yaw_lock_enter_wz: 다시 LOCK할 때 요구하는 낮은 |wz| 기준
+    // - yaw_lock_exit_wz: 일반 회전 해제를 위한 필터링된 |wz| 기준
+    // - yaw_lock_hard_exit_wz: 강한 회전이면 즉시 UNLOCK하는 raw |wz| 기준
+    // - yaw_lock_enter_xy / exit_xy: roll/pitch rate 기반 진입/해제 보조 기준
+    // - yaw_lock_enter_accel_dev: LOCK 진입 시 사용할 ||a|-g| 기준
+    // - yaw_lock_enter_hold_sec: 다시 LOCK하기 전에 요구하는 연속 안정 시간
+    // - yaw_lock_exit_hold_sec: yaw evidence가 해제 기준 이상으로 유지되어야 하는 최소 시간
+    // - yaw_lock_exit_xy_hold_sec: xy 기반 보조 해제 조건이 유지되어야 하는 최소 시간
+    // - yaw_lock_evidence_*: 저속 yaw를 "실제 회전"으로 승격시키는 evidence score 파라미터
+    // - yaw_lock_filter_tau_sec / yaw_lock_accel_filter_tau_sec: gyro/accel EMA 시정수
     yaw_zeroing_enable_ = declare_parameter<bool>("yaw_zeroing_enable", true);
-    yaw_zero_threshold_ = declare_parameter<double>("yaw_zero_threshold", 0.03);
+    yaw_zero_threshold_ = declare_parameter<double>("yaw_zero_threshold", 0.05);
     gyro_xy_stationary_threshold_ =
       declare_parameter<double>("gyro_xy_stationary_threshold", 0.05);
     accel_stationary_threshold_ =
       declare_parameter<double>("accel_stationary_threshold", 0.7);
+    yaw_lock_enter_wz_ = declare_parameter<double>("yaw_lock_enter_wz", 0.02);
+    yaw_lock_exit_wz_ = declare_parameter<double>("yaw_lock_exit_wz", yaw_zero_threshold_);
+    yaw_lock_hard_exit_wz_ = declare_parameter<double>("yaw_lock_hard_exit_wz", 0.10);
+    yaw_lock_enter_xy_ = declare_parameter<double>("yaw_lock_enter_xy", 0.03);
+    yaw_lock_exit_xy_ =
+      declare_parameter<double>("yaw_lock_exit_xy", gyro_xy_stationary_threshold_);
+    yaw_lock_enter_accel_dev_ =
+      declare_parameter<double>("yaw_lock_enter_accel_dev", 0.25);
+    yaw_lock_enter_hold_sec_ = declare_parameter<double>("yaw_lock_enter_hold_sec", 0.50);
+    yaw_lock_exit_hold_sec_ = declare_parameter<double>("yaw_lock_exit_hold_sec", 0.03);
+    yaw_lock_exit_xy_hold_sec_ =
+      declare_parameter<double>("yaw_lock_exit_xy_hold_sec", 0.08);
+    yaw_lock_evidence_wz_low_ =
+      declare_parameter<double>("yaw_lock_evidence_wz_low", 0.008);
+    yaw_lock_evidence_wz_high_ =
+      declare_parameter<double>("yaw_lock_evidence_wz_high", 0.025);
+    yaw_lock_evidence_yaw_ref_rad_ =
+      declare_parameter<double>("yaw_lock_evidence_yaw_ref_rad", 0.012);
+    yaw_lock_evidence_decay_sec_ =
+      declare_parameter<double>("yaw_lock_evidence_decay_sec", 0.40);
+    yaw_lock_evidence_unlock_threshold_ =
+      declare_parameter<double>("yaw_lock_evidence_unlock_threshold", 0.48);
+    yaw_lock_evidence_unlock_hold_sec_ =
+      declare_parameter<double>("yaw_lock_evidence_unlock_hold_sec", 0.04);
+    yaw_lock_evidence_relock_threshold_ =
+      declare_parameter<double>("yaw_lock_evidence_relock_threshold", 0.15);
+    yaw_lock_filter_tau_sec_ = declare_parameter<double>("yaw_lock_filter_tau_sec", 0.10);
+    yaw_lock_accel_filter_tau_sec_ =
+      declare_parameter<double>("yaw_lock_accel_filter_tau_sec", 0.15);
     gravity_mps2_ = declare_parameter<double>("gravity_mps2", 9.81);
     yaw_stationary_cov_ = declare_parameter<double>("yaw_stationary_cov", 1e-4);
     yaw_moving_cov_ = declare_parameter<double>("yaw_moving_cov", gyro_cov_);
@@ -72,6 +109,39 @@ private:
     tf2::Matrix3x3 m(q);
     tf2::Vector3 v(x, y, z);
     return m * v;
+  }
+
+  static inline double ema(double prev, double sample, double dt_sec, double tau_sec) {
+    if (tau_sec <= 0.0) {
+      return sample;
+    }
+    const double alpha = dt_sec / (tau_sec + dt_sec);
+    return prev + alpha * (sample - prev);
+  }
+
+  static inline double clampDt(double dt_sec) {
+    if (!(dt_sec > 0.0) || dt_sec > 0.2) {
+      return 0.02;
+    }
+    return dt_sec;
+  }
+
+  static inline double clamp01(double value) {
+    return std::max(0.0, std::min(1.0, value));
+  }
+
+  static inline double normalizeRange(double value, double min_value, double max_value) {
+    if (max_value <= min_value) {
+      return value > max_value ? 1.0 : 0.0;
+    }
+    return clamp01((value - min_value) / (max_value - min_value));
+  }
+
+  static inline double decayTowardZero(double value, double dt_sec, double tau_sec) {
+    if (tau_sec <= 0.0) {
+      return 0.0;
+    }
+    return value * std::exp(-dt_sec / tau_sec);
   }
 
   void cb(const sensor_msgs::msg::Imu::SharedPtr msg) {
@@ -174,26 +244,156 @@ private:
       out.linear_acceleration = la;
     }
 
-    // 정지 판정 시 yaw rate를 0으로 고정해 EKF yaw 드리프트 적분을 차단
+    // 정지 구간에는 yaw를 잠그되, 회전 시작은 즉시/준즉시 해제하는 비대칭 상태기계.
     if (yaw_zeroing_enable_) {
       const double wx = out.angular_velocity.x;
       const double wy = out.angular_velocity.y;
-      const double wz = out.angular_velocity.z;
+      const double raw_wz = out.angular_velocity.z;
+      const double abs_raw_wz = std::fabs(raw_wz);
+      const double raw_xy_rate = std::sqrt(wx * wx + wy * wy);
       const double acc_norm = std::sqrt(
         out.linear_acceleration.x * out.linear_acceleration.x +
         out.linear_acceleration.y * out.linear_acceleration.y +
         out.linear_acceleration.z * out.linear_acceleration.z);
+      const double raw_acc_dev = std::fabs(acc_norm - gravity_mps2_);
 
-      const bool low_yaw_rate = std::fabs(wz) < yaw_zero_threshold_;
-      const bool low_roll_pitch_rate =
-        std::fabs(wx) < gyro_xy_stationary_threshold_ &&
-        std::fabs(wy) < gyro_xy_stationary_threshold_;
-      const bool accel_near_g =
-        std::fabs(acc_norm - gravity_mps2_) < accel_stationary_threshold_;
+      double stamp_sec = rclcpp::Time(msg->header.stamp).seconds();
+      if (!(stamp_sec > 0.0)) {
+        stamp_sec = now().seconds();
+      }
+      double dt_sec = 0.02;
+      if (std::isfinite(last_yaw_lock_stamp_sec_)) {
+        dt_sec = clampDt(stamp_sec - last_yaw_lock_stamp_sec_);
+      }
+      last_yaw_lock_stamp_sec_ = stamp_sec;
 
-      yaw_clamped = low_yaw_rate && low_roll_pitch_rate && accel_near_g;
+      if (!yaw_lock_metrics_ready_) {
+        yaw_lock_signed_wz_ema_ = raw_wz;
+        yaw_lock_abs_wz_ema_ = abs_raw_wz;
+        yaw_lock_xy_rate_ema_ = raw_xy_rate;
+        yaw_lock_acc_dev_ema_ = raw_acc_dev;
+        yaw_lock_metrics_ready_ = true;
+      } else {
+        yaw_lock_signed_wz_ema_ =
+          ema(yaw_lock_signed_wz_ema_, raw_wz, dt_sec, yaw_lock_filter_tau_sec_);
+        yaw_lock_abs_wz_ema_ =
+          ema(yaw_lock_abs_wz_ema_, abs_raw_wz, dt_sec, yaw_lock_filter_tau_sec_);
+        yaw_lock_xy_rate_ema_ =
+          ema(yaw_lock_xy_rate_ema_, raw_xy_rate, dt_sec, yaw_lock_filter_tau_sec_);
+        yaw_lock_acc_dev_ema_ =
+          ema(yaw_lock_acc_dev_ema_, raw_acc_dev, dt_sec, yaw_lock_accel_filter_tau_sec_);
+      }
+
+      // 저속 yaw는 별도 상태를 만들지 않고 evidence로 누적한다.
+      // deadband를 넘는 yaw가 같은 방향으로 유지되면 signed evidence를 쌓고,
+      // yaw가 작아지면 evidence를 0 방향으로 감쇠시킨다.
+      const double yaw_over_deadband =
+        std::max(0.0, yaw_lock_abs_wz_ema_ - yaw_lock_evidence_wz_low_);
+      if (yaw_over_deadband > 0.0) {
+        if (std::fabs(yaw_lock_yaw_evidence_rad_) > 1.0e-6 &&
+            yaw_lock_yaw_evidence_rad_ * yaw_lock_signed_wz_ema_ < 0.0) {
+          yaw_lock_yaw_evidence_rad_ = 0.0;
+        }
+        yaw_lock_yaw_evidence_rad_ +=
+          std::copysign(yaw_over_deadband * dt_sec, yaw_lock_signed_wz_ema_);
+      } else {
+        yaw_lock_yaw_evidence_rad_ = decayTowardZero(
+          yaw_lock_yaw_evidence_rad_, dt_sec, yaw_lock_evidence_decay_sec_);
+      }
+
+      const double yaw_evidence_mag =
+        normalizeRange(yaw_lock_abs_wz_ema_, yaw_lock_evidence_wz_low_, yaw_lock_evidence_wz_high_);
+      const double yaw_evidence_persist =
+        normalizeRange(std::fabs(yaw_lock_yaw_evidence_rad_), 0.0, yaw_lock_evidence_yaw_ref_rad_);
+      const double yaw_evidence_xy_penalty =
+        normalizeRange(yaw_lock_xy_rate_ema_, yaw_lock_enter_xy_, yaw_lock_exit_xy_);
+
+      // score 구성:
+      // - magnitude 0.45: 지금 순간의 yaw 크기
+      // - persistence 0.45: 같은 방향 yaw가 계속 유지된 증거
+      // - xy penalty 0.20: body shake가 크면 evidence 신뢰도 감산
+      yaw_lock_evidence_score_ = clamp01(
+        0.45 * yaw_evidence_mag +
+        0.45 * yaw_evidence_persist -
+        0.20 * yaw_evidence_xy_penalty);
+
+      const bool enter_ready =
+        yaw_lock_abs_wz_ema_ < yaw_lock_enter_wz_ &&
+        yaw_lock_xy_rate_ema_ < yaw_lock_enter_xy_ &&
+        yaw_lock_acc_dev_ema_ < yaw_lock_enter_accel_dev_ &&
+        yaw_lock_evidence_score_ < yaw_lock_evidence_relock_threshold_;
+      const bool hard_exit = abs_raw_wz > yaw_lock_hard_exit_wz_;
+      const bool soft_exit_yaw_evidence =
+        yaw_lock_evidence_score_ >= yaw_lock_evidence_unlock_threshold_;
+      const bool soft_exit_xy = yaw_lock_xy_rate_ema_ > yaw_lock_exit_xy_;
+
+      std::string transition_reason;
+      if (yaw_locked_) {
+        yaw_lock_enter_accum_sec_ = 0.0;
+        if (hard_exit) {
+          yaw_locked_ = false;
+          yaw_lock_exit_evidence_accum_sec_ = 0.0;
+          yaw_lock_exit_xy_accum_sec_ = 0.0;
+          transition_reason = "hard_wz";
+        } else {
+          if (soft_exit_yaw_evidence) {
+            yaw_lock_exit_evidence_accum_sec_ += dt_sec;
+          } else {
+            yaw_lock_exit_evidence_accum_sec_ = 0.0;
+          }
+
+          if (soft_exit_xy && yaw_lock_abs_wz_ema_ > yaw_lock_evidence_wz_low_) {
+            yaw_lock_exit_xy_accum_sec_ += dt_sec;
+          } else {
+            yaw_lock_exit_xy_accum_sec_ = 0.0;
+          }
+
+          if (yaw_lock_exit_evidence_accum_sec_ >= yaw_lock_evidence_unlock_hold_sec_) {
+            yaw_locked_ = false;
+            yaw_lock_exit_evidence_accum_sec_ = 0.0;
+            yaw_lock_exit_xy_accum_sec_ = 0.0;
+            transition_reason = "yaw_evidence";
+          } else if (yaw_lock_exit_xy_accum_sec_ >= yaw_lock_exit_xy_hold_sec_) {
+            yaw_locked_ = false;
+            yaw_lock_exit_evidence_accum_sec_ = 0.0;
+            yaw_lock_exit_xy_accum_sec_ = 0.0;
+            transition_reason = "xy_hold";
+          }
+        }
+      } else {
+        yaw_lock_exit_evidence_accum_sec_ = 0.0;
+        yaw_lock_exit_xy_accum_sec_ = 0.0;
+        if (enter_ready) {
+          yaw_lock_enter_accum_sec_ += dt_sec;
+          if (yaw_lock_enter_accum_sec_ >= yaw_lock_enter_hold_sec_) {
+            yaw_locked_ = true;
+            yaw_lock_enter_accum_sec_ = 0.0;
+            transition_reason = "steady_hold";
+          }
+        } else {
+          yaw_lock_enter_accum_sec_ = 0.0;
+        }
+      }
+
+      yaw_clamped = yaw_locked_;
       if (yaw_clamped) {
         out.angular_velocity.z = 0.0;
+      }
+
+      if (yaw_clamped != last_yaw_clamped_) {
+        last_yaw_clamped_ = yaw_clamped;
+        RCLCPP_INFO(
+          get_logger(),
+          "yaw_zeroing=%s reason=%s raw_wz=%.5f wz_f=%.5f xy_f=%.5f acc_dev_f=%.5f score=%.3f eyaw=%.5f yaw_cov=%.6f",
+          yaw_clamped ? "ON" : "OFF",
+          transition_reason.empty() ? "none" : transition_reason.c_str(),
+          raw_wz,
+          yaw_lock_signed_wz_ema_,
+          yaw_lock_xy_rate_ema_,
+          yaw_lock_acc_dev_ema_,
+          yaw_lock_evidence_score_,
+          yaw_lock_yaw_evidence_rad_,
+          yaw_clamped ? yaw_stationary_cov_ : yaw_moving_cov_);
       }
     }
 
@@ -202,14 +402,6 @@ private:
     out.angular_velocity_covariance = {gyro_cov_, 0.0, 0.0,
                                        0.0, gyro_cov_, 0.0,
                                        0.0, 0.0, yaw_cov};
-    if (yaw_clamped != last_yaw_clamped_) {
-      last_yaw_clamped_ = yaw_clamped;
-      RCLCPP_INFO(get_logger(),
-                  "yaw_zeroing=%s (wz=%.5f, yaw_cov=%.6f)",
-                  yaw_clamped ? "ON" : "OFF",
-                  out.angular_velocity.z,
-                  yaw_cov);
-    }
 
     pub_->publish(out);
   }
@@ -227,13 +419,43 @@ private:
   double ema_alpha_{0.001};
   bool tf_warned_{false};
   bool yaw_zeroing_enable_{true};
-  double yaw_zero_threshold_{0.03};
+  double yaw_zero_threshold_{0.05};
   double gyro_xy_stationary_threshold_{0.05};
   double accel_stationary_threshold_{0.7};
+  double yaw_lock_enter_wz_{0.02};
+  double yaw_lock_exit_wz_{0.05};
+  double yaw_lock_hard_exit_wz_{0.10};
+  double yaw_lock_enter_xy_{0.03};
+  double yaw_lock_exit_xy_{0.05};
+  double yaw_lock_enter_accel_dev_{0.25};
+  double yaw_lock_enter_hold_sec_{0.50};
+  double yaw_lock_exit_hold_sec_{0.03};
+  double yaw_lock_exit_xy_hold_sec_{0.08};
+  double yaw_lock_evidence_wz_low_{0.008};
+  double yaw_lock_evidence_wz_high_{0.025};
+  double yaw_lock_evidence_yaw_ref_rad_{0.012};
+  double yaw_lock_evidence_decay_sec_{0.40};
+  double yaw_lock_evidence_unlock_threshold_{0.48};
+  double yaw_lock_evidence_unlock_hold_sec_{0.04};
+  double yaw_lock_evidence_relock_threshold_{0.15};
+  double yaw_lock_filter_tau_sec_{0.10};
+  double yaw_lock_accel_filter_tau_sec_{0.15};
   double gravity_mps2_{9.81};
   double yaw_stationary_cov_{1e-4};
   double yaw_moving_cov_{0.1};
   bool last_yaw_clamped_{false};
+  bool yaw_locked_{false};
+  bool yaw_lock_metrics_ready_{false};
+  double yaw_lock_signed_wz_ema_{0.0};
+  double yaw_lock_abs_wz_ema_{0.0};
+  double yaw_lock_xy_rate_ema_{0.0};
+  double yaw_lock_acc_dev_ema_{0.0};
+  double yaw_lock_yaw_evidence_rad_{0.0};
+  double yaw_lock_evidence_score_{0.0};
+  double yaw_lock_enter_accum_sec_{0.0};
+  double yaw_lock_exit_evidence_accum_sec_{0.0};
+  double yaw_lock_exit_xy_accum_sec_{0.0};
+  double last_yaw_lock_stamp_sec_{std::numeric_limits<double>::quiet_NaN()};
 
   double sum_x_{0.0};
   double sum_y_{0.0};

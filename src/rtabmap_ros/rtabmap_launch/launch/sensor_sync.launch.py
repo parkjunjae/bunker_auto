@@ -72,14 +72,38 @@ def generate_launch_description():
             'target_frame': 'base_link',  # 프레임 변환 안 함
             'tf_timeout_sec': 0.05,
             'calib_samples': 1000,  # 실제 IMU ~50Hz × 20초 = 충분한 평균으로 bias 정확도 향상
-            'stationary_threshold': 0.003,  # 더 엄격한 정지 판단 (미세 진동 포함 상태 제외)
+            'stationary_threshold': 0.01,  # 좀 낮게 정지 판단 (켈레브레이션 지연이 너무 큼 약 80초)
             'gyro_cov': 0.01,  # 휠 vyaw(0.02)보다 낮게: IMU가 주도 → 제자리 회전 시 슬립 보정 효과
             'accel_cov': 0.01,
             # 정지 구간 yaw drift 억제: EKF에 0 yaw rate를 강하게 주입
+            # 아래 파라미터는 LOCKED/UNLOCKED 2상태를 유지한 채,
+            # 저속 yaw도 "yaw evidence"로 moving 판정하게 만드는 값이다.
+            # 원칙:
+            # - hard_wz: 강한 회전은 즉시 해제
+            # - yaw evidence: 보통/저속 회전은 yaw 크기 + 지속성으로 해제
+            # - xy_hold: 마지막 fallback
             'yaw_zeroing_enable': True,
-            'yaw_zero_threshold': 0.03,             # |wz|<0.03rad/s면 정지 후보
-            'gyro_xy_stationary_threshold': 0.05,   # roll/pitch rate 정지 조건
-            'accel_stationary_threshold': 0.7,      # ||a|-g| 정지 조건
+            'yaw_zero_threshold': 0.05,             # 하위 호환용 기본 yaw 기준. 1차 튜닝 기준과 맞춘다.
+            'gyro_xy_stationary_threshold': 0.05,   # 하위 호환용 기본 xy gyro 기준. launch/코드 기본값 동기화용.
+            'accel_stationary_threshold': 0.7,      # 하위 호환용 기본 accel 기준. launch/코드 기본값 동기화용.
+            'yaw_lock_enter_wz': 0.02,              # LOCK 진입용 |wz| 상한. 이 값보다 충분히 작아야 "거의 회전 없음"으로 본다.
+            'yaw_lock_exit_wz': 0.05,               # 하위 호환용 기존 파라미터. 현재 primary unlock은 evidence score가 담당한다.
+            'yaw_lock_hard_exit_wz': 0.10,          # 강한 회전 즉시 해제 기준. 이 값 초과면 hold 없이 바로 UNLOCK.
+            'yaw_lock_enter_xy': 0.03,              # LOCK 진입용 roll/pitch rate 기준. 차체 흔들림이 있으면 잠그지 않기 위한 값.
+            'yaw_lock_exit_xy': 0.05,               # xy fallback 기준. 이제 xy는 주 해제 조건이 아니라 마지막 보조 탈출 경로다.
+            'yaw_lock_enter_accel_dev': 0.25,       # LOCK 진입용 ||a|-g| 기준. 전후진/가감속 중에는 잠기지 않게 한다.
+            'yaw_lock_enter_hold_sec': 0.50,        # LOCK 진입 유지시간. 0.5초 연속 안정일 때만 다시 잠가 채터링을 줄인다.
+            'yaw_lock_exit_hold_sec': 0.03,         # evidence unlock hold. 점수가 기준을 넘으면 30ms 유지 후 해제한다.
+            'yaw_lock_exit_xy_hold_sec': 0.08,      # xy 기반 보조 해제 유지시간. body shake만으로 풀리지 않게 wz보다 더 길게 둔다.
+            'yaw_lock_evidence_wz_low': 0.008,      # 저속 yaw deadband. 이 값 아래는 evidence를 거의 쌓지 않는다.
+            'yaw_lock_evidence_wz_high': 0.025,     # yaw magnitude 정규화 상단. 이 값이면 magnitude evidence를 충분히 본다.
+            'yaw_lock_evidence_yaw_ref_rad': 0.012, # same-sign yaw 누적 기준. 약 0.7도 누적되면 persistence evidence가 충분해진다.
+            'yaw_lock_evidence_decay_sec': 0.40,    # yaw가 사라졌을 때 evidence를 얼마나 빨리 0으로 되돌릴지 정하는 감쇠 시간.
+            'yaw_lock_evidence_unlock_threshold': 0.48, # yaw evidence score 해제 임계값. 보통/저속 실제 회전을 moving으로 승격하는 기준.
+            'yaw_lock_evidence_unlock_hold_sec': 0.04,  # evidence score가 기준 이상으로 유지되어야 하는 최소 시간.
+            'yaw_lock_evidence_relock_threshold': 0.15, # 저속 yaw가 계속 남아 있을 때 다시 LOCK으로 재진입하지 않게 막는 기준.
+            'yaw_lock_filter_tau_sec': 0.10,        # gyro EMA 시정수. 샘플 노이즈는 줄이고 회전 응답은 크게 늦추지 않는 값.
+            'yaw_lock_accel_filter_tau_sec': 0.15,  # accel EMA 시정수. accel은 더 튀므로 gyro보다 약간 더 느리게 평활화.
             'gravity_mps2': 9.81,
             'yaw_stationary_cov': 1.0e-4,           # 정지 시 z축 공분산(작게)
             'yaw_moving_cov': 0.01,                 # 회전 시 z축 공분산

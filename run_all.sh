@@ -160,12 +160,8 @@ wait_for_tf "odom" "base_link" 15
 run_ros_with_nav2_env "rtabmap_nav2" "ros2 launch rtabmap_launch rtabmap_nav2.launch.py"
 sleep "$SLEEP_SEC"
 
-# icp_odom 발행 확인 (EKF가 이미 동작 중이므로 빠르게 수렴)
-wait_for_topic "/icp_odom" 30
-
 # 4.5) 핵심 토픽/TF가 준비된 뒤 agent PID 시작
 wait_for_topic "/odometry/filtered" 10
-wait_for_tf "odom" "base_link" 10
 wait_for_topic "/rtabmap/map" 10
 wait_for_tf "map" "odom" 15
 wait_for_topic "/global_costmap/costmap" 15
