@@ -20,6 +20,9 @@ add_executable(livox_pointcloud_filter_node
 add_executable(dynamic_object_filter_node
   src/dynamic_object_filter_node.cpp
 )
+add_executable(depth_nav_filter_node
+  src/depth_nav_filter_node.cpp
+)
 
 target_include_directories(livox_pointcloud_filter_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -31,11 +34,19 @@ target_include_directories(dynamic_object_filter_node PUBLIC
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
+target_include_directories(depth_nav_filter_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
 
 target_link_libraries(livox_pointcloud_filter_node
   ${PCL_LIBRARIES}
 )
 target_link_libraries(dynamic_object_filter_node
+  ${PCL_LIBRARIES}
+)
+target_link_libraries(depth_nav_filter_node
   ${PCL_LIBRARIES}
 )
 
@@ -53,10 +64,19 @@ ament_target_dependencies(dynamic_object_filter_node
   tf2_ros
   tf2_sensor_msgs
 )
+ament_target_dependencies(depth_nav_filter_node
+  rclcpp
+  sensor_msgs
+  pcl_conversions
+  pcl_ros
+  tf2_ros
+  tf2_sensor_msgs
+)
 
 install(TARGETS
   livox_pointcloud_filter_node
   dynamic_object_filter_node
+  depth_nav_filter_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

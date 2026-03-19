@@ -46,7 +46,7 @@ ekf_filter_node:
     imu0_queue_size: 200 # IMU 큐 크기(고주파 센서라 크게 설정)
     imu0_differential: false # 절대 orientation/각속도 사용
     imu0_relative: false # 상대 누적을 끄고 yaw rate만 보조로 사용
-    imu0_twist_rejection_threshold: 1.5 # 비정상 yaw rate 스파이크(rad/s) 차단
+    imu0_twist_rejection_threshold: 3.0 # IMU의 angular velocity 측정을 EKF가 버릴지 말지 정하는 rejection 기준
     imu0_remove_gravitational_acceleration: false # 가속도에서 중력 성분 제거 여부
     # imu0_config 순서는 odom0_config와 동일
     imu0_config: [

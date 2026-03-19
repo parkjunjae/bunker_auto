@@ -23,6 +23,7 @@ def generate_launch_description():
     delete_db_on_start = LaunchConfiguration('delete_db_on_start')
     livox_deskewed_topic = LaunchConfiguration('livox_deskewed_topic')
     livox_filtered_topic = LaunchConfiguration('livox_filtered_topic')
+    depth_nav_filtered_topic = LaunchConfiguration('depth_nav_filtered_topic')
     use_dynamic_filter = LaunchConfiguration('use_dynamic_filter')
     dynamic_filter_output = LaunchConfiguration('dynamic_filter_output')
     dynamic_voxel_size = LaunchConfiguration('dynamic_voxel_size')
@@ -35,6 +36,10 @@ def generate_launch_description():
     dynamic_min_range = LaunchConfiguration('dynamic_min_range')
     dynamic_target_frame = LaunchConfiguration('dynamic_target_frame')
     dynamic_tf_timeout_sec = LaunchConfiguration('dynamic_tf_timeout_sec')
+    enable_spin_yaw_probe = LaunchConfiguration('enable_spin_yaw_probe')
+    spin_yaw_probe_output = LaunchConfiguration('spin_yaw_probe_output')
+    spin_yaw_probe_trial_id = LaunchConfiguration('spin_yaw_probe_trial_id')
+    spin_yaw_probe_tick_hz = LaunchConfiguration('spin_yaw_probe_tick_hz')
 
     rtabmap_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -170,6 +175,42 @@ def generate_launch_description():
             'log_period_sec': 0.05,
         }],
     )
+    spin_yaw_probe_node = Node(
+        package='rtabmap_launch',
+        executable='spin_yaw_probe.py',
+        name='spin_yaw_probe',
+        output='screen',
+        condition=IfCondition(enable_spin_yaw_probe),
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'odom_topic': '/odometry/filtered',
+            'imu_topic': '/camera/camera/imu_fixed',
+            'tf_parent_frame': 'odom',
+            'tf_child_frame': 'base_link',
+            'tf_lookup_timeout_sec': 0.02,
+            'trial_id': spin_yaw_probe_trial_id,
+            'output_path': spin_yaw_probe_output,
+            'tick_hz': spin_yaw_probe_tick_hz,
+            'log_period_sec': 1.0,
+            # Keep the probe detector aligned with the runtime stabilizers so
+            # the logged spin windows and the mitigation windows are comparable.
+            'wz_filter_tau_sec': 0.06,
+            'speed_filter_tau_sec': 0.12,
+            'spin_wz_start': 0.08,
+            'spin_wz_full': 0.18,
+            'spin_speed_quiet': 0.05,
+            'spin_duration_ref_sec': 0.80,
+            'spin_yaw_ref_rad': 0.20,
+            'spin_decay_sec': 0.80,
+            'score_fast_weight': 0.75,
+            'score_slow_weight': 0.25,
+            'score_rise_tau_sec': 0.05,
+            'score_fall_tau_sec': 0.50,
+            'session_enter_score': 0.55,
+            'session_exit_score': 0.20,
+            'session_exit_hold_sec': 0.25,
+        }],
+    )
     livox_filter_node = Node(
         package='livox_pointcloud_filter',          # 필터 노드가 들어있는 패키지
         executable='livox_pointcloud_filter_node',  # 실행할 노드 이름
@@ -183,6 +224,45 @@ def generate_launch_description():
             'ror_min_neighbors': 2,                  # ROR 이웃 최소: 낮춰서 loop closure용 포인트 보존
             'use_voxel': True,                       # VoxelGrid 다운샘플 사용 여부
             'use_ror': True,                         # ROR 노이즈 제거 사용 여부
+        }],
+    )
+    depth_nav_filter_node = Node(
+        package='livox_pointcloud_filter',
+        executable='depth_nav_filter_node',
+        name='depth_nav_filter',
+        output='screen',
+        parameters=[{
+            'input_topic': '/camera/camera/depth/color/points',
+            'output_topic': depth_nav_filtered_topic,
+            # navigation에서는 base_link 기준 근거리 점을 자르는 편이 self-mask/footprint와 맞춘 해석이 쉽다.
+            'target_frame': 'base_link',
+            'tf_timeout_sec': 0.05,
+            # depth는 근거리 보강용만 맡기고, 먼 거리 obstacle은 LiDAR에 맡긴다.
+            'min_x': -0.05,
+            'max_x': 1.20,
+            'max_abs_y': 1.00,
+            'z_min': 0.10,
+            'z_max': 1.20,
+            'max_range': 1.20,
+            # 카메라 바로 앞 specular/엣지 노이즈를 자르기 위한 blind-zone
+            'sensor_origin_x': 0.30,
+            'sensor_origin_y': 0.00,
+            'sensor_blind_radius': 0.18,
+            # 로봇 자기 몸체와 범퍼 가장자리 반사를 제거하는 self-mask
+            'self_mask_min_x': -0.67,
+            'self_mask_max_x': 0.67,
+            'self_mask_min_y': -0.44,
+            'self_mask_max_y': 0.44,
+            # 희소한 depth 점은 costmap false obstacle이 되기 쉬워 ROR를 LiDAR보다 더 강하게 건다.
+            'voxel_leaf_size': 0.04,
+            'ror_radius': 0.10,
+            'ror_min_neighbors': 6,
+            # 두 프레임 이상 반복 관측된 점만 obstacle로 인정해 깜빡이는 blob을 줄인다.
+            'temporal_voxel_size': 0.05,
+            'temporal_min_hits': 2,
+            'temporal_hit_window_sec': 0.35,
+            'temporal_max_stale_sec': 0.50,
+            'log_period_sec': 2.0,
         }],
     )
     dynamic_filter_node = Node(
@@ -298,6 +378,8 @@ def generate_launch_description():
                              description='Deskewed LiDAR topic used by RTAB-Map and Livox filter'),
         DeclareLaunchArgument('livox_filtered_topic', default_value='/livox/lidar/filtered',
                              description='Filtered LiDAR topic for Nav2 costmap marking'),
+        DeclareLaunchArgument('depth_nav_filtered_topic', default_value='/camera/camera/depth/color/nav_points',
+                             description='Filtered depth topic for Nav2 local obstacle marking'),
         DeclareLaunchArgument('use_dynamic_filter', default_value='true',
                              description='Enable dynamic object filter for global-map-friendly static cloud'),
         DeclareLaunchArgument('dynamic_filter_output', default_value='/livox/lidar/static_filtered',
@@ -322,6 +404,14 @@ def generate_launch_description():
                              description='Accumulation frame for dynamic filter (odom or map)'),
         DeclareLaunchArgument('dynamic_tf_timeout_sec', default_value='0.12',
                              description='TF lookup timeout for dynamic filter'),
+        DeclareLaunchArgument('enable_spin_yaw_probe', default_value='false',
+                             description='Enable spin_yaw_probe JSONL logger'),
+        DeclareLaunchArgument('spin_yaw_probe_output', default_value='',
+                             description='Optional JSONL output path for spin_yaw_probe'),
+        DeclareLaunchArgument('spin_yaw_probe_trial_id', default_value='',
+                             description='Optional trial_id label for spin_yaw_probe records'),
+        DeclareLaunchArgument('spin_yaw_probe_tick_hz', default_value='20.0',
+                             description='Sampling rate for spin_yaw_probe'),
         # Keep args empty to avoid overriding ROS params.
         DeclareLaunchArgument('rtabmap_args', default_value='', description='Extra CLI flags for rtabmap'),
         # Use ROS param to control DB reset from this launch file.
@@ -330,7 +420,9 @@ def generate_launch_description():
         rtabmap_launch,
         map_tf_stabilizer_node,
         map_topic_stabilizer_node,
+        spin_yaw_probe_node,
         livox_filter_node,
+        depth_nav_filter_node,
         dynamic_filter_node,
         nav2_server_nodes,
         lifecycle_manager_node

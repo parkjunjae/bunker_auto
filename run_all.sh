@@ -140,7 +140,10 @@ fi
 # 2) Sensors
 run_ros "livox" "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
 sleep "$SLEEP_SEC"
-run_realsense "realsense" "ros2 launch realsense2_camera rs_launch.py rgb_camera.color_profile:=848x480x30 depth_module.depth_profile:=848x480x30"
+# RealSense depth를 navigation 보조 센서로 다시 쓰되,
+# raw false depth를 줄이기 위해 align/sync와 기본 post-processing을 함께 켠다.
+# hole filling은 없던 점을 메워 가짜 obstacle을 키울 수 있어 초기값에서는 끈다.
+run_realsense "realsense" "ros2 launch realsense2_camera rs_launch.py rgb_camera.color_profile:=848x480x30 depth_module.depth_profile:=848x480x30 pointcloud.enable:=true align_depth.enable:=true enable_sync:=true clip_distance:=1.5 decimation_filter.enable:=true decimation_filter.filter_magnitude:=2 spatial_filter.enable:=true temporal_filter.enable:=true hole_filling_filter.enable:=false"
 sleep "$SLEEP_SEC"
 run_ros "ec25_gps" "ros2 launch ec25_gps_bridge ec25_gps_bridge.launch.py"
 sleep "$SLEEP_SEC"
@@ -150,6 +153,7 @@ run_ros "bunker_base" "ros2 launch bunker_base bunker_base.launch.py"
 sleep "$SLEEP_SEC"
 run_ros "sensor_sync" "ros2 launch rtabmap_launch sensor_sync.launch.py"
 sleep "$SLEEP_SEC"
+
 # 4) EKF 먼저 시작 (odom→base_link TF 발행 → icp_odometry의 guess_from_tf 가능)
 # EKF는 /odom(휠) + IMU만으로도 즉시 동작 가능. icp_odom은 나중에 추가됨.
 run_ros "ekf" "ros2 launch robot_localization ekf.launch.py"

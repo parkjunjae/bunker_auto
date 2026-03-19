@@ -91,8 +91,8 @@ controller_server:
     RLController:
       plugin: "rl_local_controller/RlLocalController"
       # ---- 최대속도-------
-      max_lin: 0.25
-      max_ang: 0.5
+      max_lin: 0.5
+      max_ang: 0.7
       # ---- 장애물 근접 감속/정지 거리-------
       # 전방이 이 거리보다 가까우면 회전/크립 모드로 전환
       stop_dist: 0.30
@@ -226,8 +226,8 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 10
-      height: 10
+      width: 5
+      height: 5
       resolution: 0.05
       footprint: "[[0.62, 0.389], [0.62, -0.389], [-0.62, -0.389], [-0.62, 0.389]]"
       footprint_padding: 0.0
@@ -240,10 +240,9 @@ local_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
         footprint_clearing_enabled: true
-        # 라이다 + 카메라 depth 포인트를 함께 사용
-        # - 라이다: 좁은 통로/벽 인식
-        # - depth: 근거리 저반사(검은 소파) 보강
-        observation_sources: lidar_mark lidar_clear depth_mark
+        # LiDAR는 기본 장애물 소스로 유지하고,
+        # 카메라는 raw depth 대신 nav 전용으로 강하게 필터링한 토픽만 사용한다.
+        observation_sources: lidar_mark lidar_clear depth_mark_filtered
 
         lidar_mark:
           # Dynamic filter output: keep static obstacles, suppress short-lived moving objects
@@ -269,17 +268,17 @@ local_costmap:
           min_obstacle_height: 0.05
           max_obstacle_height: 1.5
 
-        depth_mark:
-          # RealSense pointcloud 토픽(환경에 맞게 수정)
-          topic: /camera/camera/depth/color/points
+        depth_mark_filtered:
+          # raw depth는 false obstacle이 잦았으므로, navigation 전용 필터를 거친 점군만 쓴다.
+          topic: /camera/camera/depth/color/nav_points
           data_type: PointCloud2
-          sensor_frame: camera_link # TF 변환 기준 프레임 명시 (회전 시 오차 방지)
+          sensor_frame: base_link
           marking: true
           clearing: false
-          obstacle_range: 1.5 # 근거리 보강용
-          min_obstacle_height: 0.05
-          max_obstacle_height: 1.5
-          observation_persistence: 0.5 # 0.2s→0.5s: 카메라 드롭 시 깜빡임 방지
+          obstacle_range: 0.8
+          min_obstacle_height: 0.10
+          max_obstacle_height: 1.20
+          observation_persistence: 0.10
           expected_update_rate: 0.0
 
       # voxel_layer:  # 필요 시 다시 사용 (3D voxel)

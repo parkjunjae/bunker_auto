@@ -366,7 +366,7 @@ def launch_setup(context, *args, **kwargs):
                 "RGBD/ProximityMaxGraphDepth": "0",
                 "RGBD/ProximityPathMaxNeighbors": "0",
                 
-                "RGBD/LinearUpdate": "0.50",
+                "RGBD/LinearUpdate": "0.15",
                 "RGBD/AngularUpdate": "6.28",
                 # 처리 주기(Hz)
                 "Rtabmap/DetectionRate": "5.0",
