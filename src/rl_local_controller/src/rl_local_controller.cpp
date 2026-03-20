@@ -4,8 +4,12 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/footprint_collision_checker.hpp"
+#include "nav2_costmap_2d/footprint.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -91,6 +95,45 @@ void RlLocalController::configure(
     node_, name_ + ".treat_unknown_as_obstacle",
     rclcpp::ParameterValue(treat_unknown_as_obstacle_));
   nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".enable_footprint_collision_gate",
+    rclcpp::ParameterValue(enable_footprint_collision_gate_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".collision_gate_front_activation_dist",
+    rclcpp::ParameterValue(collision_gate_front_activation_dist_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".collision_gate_side_activation_dist",
+    rclcpp::ParameterValue(collision_gate_side_activation_dist_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".forward_sim_horizon_sec",
+    rclcpp::ParameterValue(forward_sim_horizon_sec_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".forward_sim_dt",
+    rclcpp::ParameterValue(forward_sim_dt_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".rotate_sim_horizon_sec",
+    rclcpp::ParameterValue(rotate_sim_horizon_sec_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".rotate_sim_dt",
+    rclcpp::ParameterValue(rotate_sim_dt_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".micro_progress_sim_horizon_sec",
+    rclcpp::ParameterValue(micro_progress_sim_horizon_sec_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".micro_progress_sim_dt",
+    rclcpp::ParameterValue(micro_progress_sim_dt_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".micro_progress_front_margin",
+    rclcpp::ParameterValue(micro_progress_front_margin_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".micro_progress_side_margin",
+    rclcpp::ParameterValue(micro_progress_side_margin_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".micro_progress_heading_max",
+    rclcpp::ParameterValue(micro_progress_heading_max_));
+  nav2_util::declare_parameter_if_not_declared(
+    node_, name_ + ".footprint_collision_cost_threshold",
+    rclcpp::ParameterValue(footprint_collision_cost_threshold_));
+  nav2_util::declare_parameter_if_not_declared(
     node_, name_ + ".use_pid", rclcpp::ParameterValue(use_pid_));
   nav2_util::declare_parameter_if_not_declared(
     node_, name_ + ".pid_kp_lin", rclcpp::ParameterValue(pid_kp_lin_));
@@ -139,6 +182,45 @@ void RlLocalController::configure(
   node_->get_parameter(name_ + ".raycast_step", raycast_step_);
   node_->get_parameter(name_ + ".cost_threshold", cost_threshold_);
   node_->get_parameter(name_ + ".treat_unknown_as_obstacle", treat_unknown_as_obstacle_);
+  node_->get_parameter(
+    name_ + ".enable_footprint_collision_gate",
+    enable_footprint_collision_gate_);
+  node_->get_parameter(
+    name_ + ".collision_gate_front_activation_dist",
+    collision_gate_front_activation_dist_);
+  node_->get_parameter(
+    name_ + ".collision_gate_side_activation_dist",
+    collision_gate_side_activation_dist_);
+  node_->get_parameter(
+    name_ + ".forward_sim_horizon_sec",
+    forward_sim_horizon_sec_);
+  node_->get_parameter(
+    name_ + ".forward_sim_dt",
+    forward_sim_dt_);
+  node_->get_parameter(
+    name_ + ".rotate_sim_horizon_sec",
+    rotate_sim_horizon_sec_);
+  node_->get_parameter(
+    name_ + ".rotate_sim_dt",
+    rotate_sim_dt_);
+  node_->get_parameter(
+    name_ + ".micro_progress_sim_horizon_sec",
+    micro_progress_sim_horizon_sec_);
+  node_->get_parameter(
+    name_ + ".micro_progress_sim_dt",
+    micro_progress_sim_dt_);
+  node_->get_parameter(
+    name_ + ".micro_progress_front_margin",
+    micro_progress_front_margin_);
+  node_->get_parameter(
+    name_ + ".micro_progress_side_margin",
+    micro_progress_side_margin_);
+  node_->get_parameter(
+    name_ + ".micro_progress_heading_max",
+    micro_progress_heading_max_);
+  node_->get_parameter(
+    name_ + ".footprint_collision_cost_threshold",
+    footprint_collision_cost_threshold_);
   node_->get_parameter(name_ + ".use_pid", use_pid_);
   node_->get_parameter(name_ + ".pid_kp_lin", pid_kp_lin_);
   node_->get_parameter(name_ + ".pid_ki_lin", pid_ki_lin_);
@@ -424,6 +506,55 @@ geometry_msgs::msg::TwistStamped RlLocalController::computeVelocityCommands(
     }
   }
 
+  // 2차 안전 게이트:
+  // 기존 RL 로직은 중심 raycast 기반으로 후보 명령을 만든다.
+  // 이번 버전에서는 아무 상황에서나 이 gate를 강하게 돌리지 않는다.
+  // 자유 공간에서는 원래 RL 행동을 유지하고,
+  // 장애물이 충분히 가까운 구간에서만 "실제 차체 기준" 검사를 개입시킨다.
+  if (enable_footprint_collision_gate_ &&
+    shouldApplyCollisionGate(front, left, right, v_des, w_des))
+  {
+    int preferred_turn_dir = 0;
+    if (std::abs(lr_diff) >= turn_deadband_) {
+      preferred_turn_dir = (lr_diff > 0.0) ? 1 : -1;
+    } else if (std::abs(w_des) > 1e-3) {
+      preferred_turn_dir = (w_des >= 0.0) ? 1 : -1;
+    } else if (std::abs(heading_error) > 1e-3) {
+      preferred_turn_dir = (heading_error >= 0.0) ? 1 : -1;
+    } else if (last_turn_dir_ != 0) {
+      preferred_turn_dir = last_turn_dir_;
+    } else {
+      preferred_turn_dir = 1;
+    }
+
+    const double original_v = v_des;
+    const double original_w = w_des;
+    const bool found_safe_command =
+      selectCollisionFreeCommand(
+      pose, front, left, right, heading_abs,
+      preferred_turn_dir, original_v, original_w, v_des, w_des);
+
+    if (!found_safe_command) {
+      RCLCPP_WARN_THROTTLE(
+        logger_, *node_->get_clock(), 2000,
+        "footprint collision gate: 후보 명령(v=%.3f, w=%.3f)을 차단했고, 안전한 대체 명령을 찾지 못해 정지합니다.",
+        original_v, original_w);
+    } else if (
+      std::abs(v_des - original_v) > 1e-3 ||
+      std::abs(w_des - original_w) > 1e-3)
+    {
+      RCLCPP_INFO_THROTTLE(
+        logger_, *node_->get_clock(), 2000,
+        "footprint collision gate: 후보 명령(v=%.3f, w=%.3f)을 더 안전한 명령(v=%.3f, w=%.3f)으로 조정했습니다.",
+        original_v, original_w, v_des, w_des);
+    }
+  }
+
+  // 최종적으로 채택된 회전 방향을 저장해 다음 프레임에서 흔들림을 줄인다.
+  if (std::abs(w_des) > 1e-3) {
+    last_turn_dir_ = (w_des >= 0.0) ? 1 : -1;
+  }
+
   // PID 이전 단계에서 목표 속도 발행(학습/디버깅용)
   if (desired_cmd_pub_) {
     geometry_msgs::msg::TwistStamped desired;
@@ -492,6 +623,319 @@ geometry_msgs::msg::TwistStamped RlLocalController::computeVelocityCommands(
   cmd.twist.linear.x = v_out;
   cmd.twist.angular.z = w_out;
   return cmd;
+}
+
+void RlLocalController::simulatePoseStep(
+  double & x,
+  double & y,
+  double & yaw,
+  double v,
+  double w,
+  double dt) const
+{
+  // 아주 짧은 구간에서는 단순 오일러보다 중간 heading을 쓰는 편이
+  // 회전 중 전진 경로를 조금 더 안정적으로 근사한다.
+  const double mid_yaw = yaw + 0.5 * w * dt;
+  x += std::cos(mid_yaw) * v * dt;
+  y += std::sin(mid_yaw) * v * dt;
+  yaw = normalizeAngle(yaw + w * dt);
+}
+
+bool RlLocalController::isPoseCollisionFree(double x, double y, double yaw) const
+{
+  auto * costmap = costmap_ros_->getCostmap();
+  if (costmap == nullptr) {
+    return false;
+  }
+
+  // 현재 costmap에 이미 적용된 padded footprint를 그대로 사용한다.
+  // 즉 운영 파라미터(footprint_padding)의 효과가 collision gate에도 동일하게 반영된다.
+  const auto footprint = costmap_ros_->getRobotFootprint();
+  if (footprint.size() < 3) {
+    return false;
+  }
+
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> checker(costmap);
+  const double footprint_cost = checker.footprintCostAtPose(x, y, yaw, footprint);
+
+  // threshold 이상이면 실제 차체 외곽이 lethal / inscribed / unknown 고비용 영역과
+  // 닿는다고 보고 통과 불가로 판정한다.
+  return footprint_cost < static_cast<double>(footprint_collision_cost_threshold_);
+}
+
+bool RlLocalController::evaluateCommandCandidate(
+  const geometry_msgs::msg::PoseStamped & pose,
+  double v,
+  double w,
+  double horizon_override_sec,
+  double dt_override_sec,
+  double & predicted_x,
+  double & predicted_y,
+  double & predicted_yaw) const
+{
+  if (!std::isfinite(v) || !std::isfinite(w)) {
+    return false;
+  }
+
+  double horizon_sec = 0.0;
+  double dt = 0.0;
+  if (horizon_override_sec > 1e-6 && dt_override_sec > 1e-6) {
+    // 일부 deadlock 해소 후보는 기본 forward 후보보다 더 짧은 구간만 본다.
+    // 이렇게 하면 "아주 짧게는 안전한" 미세 전진 후보를 과도하게 죽이지 않을 수 있다.
+    horizon_sec = horizon_override_sec;
+    dt = dt_override_sec;
+  } else {
+    getSimulationWindowForCommand(v, w, horizon_sec, dt);
+  }
+  dt = std::max(0.02, dt);
+  const int steps = std::max(1, static_cast<int>(std::ceil(
+    std::max(dt, horizon_sec) / dt)));
+
+  // 현재 pose는 이미 컨트롤러가 서 있는 위치이므로,
+  // 여기서는 "지금 이 명령을 내보냈을 때 다음 순간부터 부딪히는가"를 본다.
+  double x = pose.pose.position.x;
+  double y = pose.pose.position.y;
+  double yaw = getYaw(pose);
+
+  for (int i = 0; i < steps; ++i) {
+    simulatePoseStep(x, y, yaw, v, w, dt);
+    if (!isPoseCollisionFree(x, y, yaw)) {
+      return false;
+    }
+  }
+
+  // 마지막 예측 pose를 돌려줘 progress score 계산에 재사용한다.
+  predicted_x = x;
+  predicted_y = y;
+  predicted_yaw = yaw;
+  return true;
+}
+
+bool RlLocalController::shouldApplyCollisionGate(
+  double front,
+  double left,
+  double right,
+  double v,
+  double w) const
+{
+  // gate를 항상 켜면 자유공간에서도 전진 후보를 지나치게 많이 죽일 수 있다.
+  // 따라서 실제 장애물이 가까운 상황에서만 차체 기반 정밀 검사를 수행한다.
+  const double side_min = std::min(left, right);
+  const bool near_front_obstacle = front <= collision_gate_front_activation_dist_;
+  const bool near_side_obstacle = side_min <= collision_gate_side_activation_dist_;
+  const bool translating = std::abs(v) > 1e-3;
+  const bool turning = std::abs(w) > min_turn_rate_ * 0.5;
+
+  if (near_front_obstacle || near_side_obstacle) {
+    return true;
+  }
+
+  // 자유공간에서 아주 약한 회전/전진까지 게이트를 걸면 progress가 쉽게 죽는다.
+  // 반대로 큰 병진/회전이 같이 들어가는 명령은 차체 sweep이 커질 수 있어 계속 검사한다.
+  return translating && turning;
+}
+
+void RlLocalController::getSimulationWindowForCommand(
+  double v,
+  double w,
+  double & horizon_sec,
+  double & dt) const
+{
+  const bool translating = std::abs(v) > 1e-3;
+
+  if (translating) {
+    // 전진/후진 명령은 실제 접촉까지 이어질 수 있으므로 조금 더 길게 본다.
+    horizon_sec = forward_sim_horizon_sec_;
+    dt = forward_sim_dt_;
+  } else {
+    // 제자리 회전은 너무 긴 horizon을 주면 불필요하게 보수적이 되고,
+    // 좌우 짧은 흔들림만 늘 수 있어 더 짧은 구간만 본다.
+    horizon_sec = rotate_sim_horizon_sec_;
+    dt = rotate_sim_dt_;
+  }
+}
+
+double RlLocalController::scoreSafeCandidate(
+  const geometry_msgs::msg::PoseStamped & pose,
+  double predicted_x,
+  double predicted_y,
+  double predicted_yaw,
+  double candidate_v,
+  double candidate_w,
+  double preferred_turn_dir,
+  double original_v,
+  double original_w) const
+{
+  // progress-friendly score:
+  // 1) 실제로 goal/lookahead 쪽 거리를 줄이는 후보를 우선
+  // 2) heading 오차를 줄이는 후보를 우선
+  // 3) 그래도 전진성이 있는 후보를 약간 우선
+  // 4) 후진은 최후 수단이므로 강하게 감점
+  double score = 0.0;
+  const double current_x = pose.pose.position.x;
+  const double current_y = pose.pose.position.y;
+  const double current_yaw = getYaw(pose);
+
+  double target_x = 0.0;
+  double target_y = 0.0;
+  if (!getLookaheadTarget(pose, lookahead_dist_, target_x, target_y)) {
+    if (!plan_.poses.empty()) {
+      target_x = plan_.poses.back().pose.position.x;
+      target_y = plan_.poses.back().pose.position.y;
+    } else {
+      target_x = current_x;
+      target_y = current_y;
+    }
+  }
+
+  const double current_goal_dist = std::hypot(target_x - current_x, target_y - current_y);
+  const double predicted_goal_dist = std::hypot(target_x - predicted_x, target_y - predicted_y);
+  const double progress_gain = current_goal_dist - predicted_goal_dist;
+
+  const double current_heading_abs = std::abs(normalizeAngle(
+      std::atan2(target_y - current_y, target_x - current_x) - current_yaw));
+  const double predicted_heading_abs = std::abs(normalizeAngle(
+      std::atan2(target_y - predicted_y, target_x - predicted_x) - predicted_yaw));
+  const double heading_gain_score = current_heading_abs - predicted_heading_abs;
+
+  // "실제 얼마나 goal 쪽으로 나아갔는가"를 가장 큰 항으로 둔다.
+  score += 24.0 * progress_gain;
+  // heading이 좋아지는 후보도 가점하되, 전진 거리보다 조금 약하게 둔다.
+  score += 3.0 * heading_gain_score;
+
+  if (candidate_v > 0.0) {
+    score += 3.0 * (candidate_v / std::max(0.05, max_lin_));
+  } else if (candidate_v < 0.0) {
+    score -= 8.0;
+  } else {
+    score -= 1.5;
+  }
+
+  if (std::abs(candidate_w) > 1e-3 && preferred_turn_dir != 0.0) {
+    if ((candidate_w > 0.0 && preferred_turn_dir > 0.0) ||
+      (candidate_w < 0.0 && preferred_turn_dir < 0.0))
+    {
+      score += 2.0;
+    } else {
+      score -= 2.0;
+    }
+  }
+
+  // 원래 명령과 너무 멀리 벌어진 후보는 progress와 자연스러운 추종을 해칠 수 있으므로 소폭 감점.
+  score -= 0.8 * std::abs(candidate_v - original_v) / std::max(0.05, max_lin_);
+  score -= 0.4 * std::abs(candidate_w - original_w) / std::max(0.1, max_ang_);
+
+  return score;
+}
+
+bool RlLocalController::selectCollisionFreeCommand(
+  const geometry_msgs::msg::PoseStamped & pose,
+  double front,
+  double left,
+  double right,
+  double heading_abs,
+  int preferred_turn_dir,
+  double original_v,
+  double original_w,
+  double & v,
+  double & w) const
+{
+  struct CandidateSpec
+  {
+    double v{0.0};
+    double w{0.0};
+    double horizon_override_sec{0.0};
+    double dt_override_sec{0.0};
+  };
+
+  const int turn_dir = preferred_turn_dir >= 0 ? 1 : -1;
+  const double desired_turn_mag = clamp(
+    std::max(std::abs(original_w), min_turn_rate_), min_turn_rate_, max_ang_);
+  const double side_min = std::min(left, right);
+  const bool allow_micro_progress =
+    original_v > 0.0 &&
+    front > (hard_stop_dist_ + micro_progress_front_margin_) &&
+    side_min > (rotate_min_side_clearance_ + micro_progress_side_margin_) &&
+    heading_abs < micro_progress_heading_max_;
+
+  // 이번 버전은 "첫 번째로 안전한 후보"를 바로 고르지 않는다.
+  // 안전한 후보를 모두 모은 뒤, 그중 실제 goal 쪽 진행량이 더 큰
+  // progress-friendly 후보를 고른다.
+  std::vector<CandidateSpec> candidates;
+  candidates.reserve(9);
+  candidates.push_back({original_v, original_w, 0.0, 0.0});
+
+  // deadlock 해소용 micro-progress 후보:
+  // 원래 명령이 막혔을 때도 "조금만 더 신중하게 전진하면 풀릴 수 있는" 경우를 살리기 위해,
+  // 매우 제한된 조건에서만 1~2개의 짧은 전진 후보를 추가한다.
+  if (allow_micro_progress) {
+    const double micro_v_fast = clamp(
+      std::max(creep_speed_, 0.40 * original_v),
+      0.0, std::min(max_lin_, 0.12));
+    const double micro_v_slow = clamp(
+      std::max(creep_speed_, 0.25 * original_v),
+      0.0, std::min(max_lin_, 0.08));
+    const double micro_w_hold = clamp(original_w, -max_ang_, max_ang_);
+    const double micro_w_turn = clamp(
+      std::abs(original_w) > 1e-3 ? 1.2 * original_w :
+      static_cast<double>(turn_dir) * min_turn_rate_,
+      -max_ang_, max_ang_);
+
+    candidates.push_back(
+      {micro_v_fast, micro_w_hold, micro_progress_sim_horizon_sec_, micro_progress_sim_dt_});
+    candidates.push_back(
+      {micro_v_slow, micro_w_turn, micro_progress_sim_horizon_sec_, micro_progress_sim_dt_});
+  }
+
+  candidates.push_back({0.0, turn_dir * desired_turn_mag, 0.0, 0.0});
+  candidates.push_back({0.0, turn_dir * min_turn_rate_, 0.0, 0.0});
+  candidates.push_back({0.0, -turn_dir * desired_turn_mag, 0.0, 0.0});
+  candidates.push_back({0.0, -turn_dir * min_turn_rate_, 0.0, 0.0});
+  candidates.push_back({-std::max(0.0, escape_reverse_speed_), turn_dir * min_turn_rate_, 0.0, 0.0});
+  candidates.push_back({-std::max(0.0, escape_reverse_speed_), -turn_dir * min_turn_rate_, 0.0, 0.0});
+
+  bool found_safe_candidate = false;
+  double best_score = -std::numeric_limits<double>::infinity();
+  double best_v = 0.0;
+  double best_w = 0.0;
+
+  for (const auto & candidate : candidates) {
+    if (!escape_use_reverse_ && candidate.v < 0.0) {
+      continue;
+    }
+    double predicted_x = pose.pose.position.x;
+    double predicted_y = pose.pose.position.y;
+    double predicted_yaw = getYaw(pose);
+    if (evaluateCommandCandidate(
+        pose, candidate.v, candidate.w,
+        candidate.horizon_override_sec, candidate.dt_override_sec,
+        predicted_x, predicted_y, predicted_yaw))
+    {
+      const double score = scoreSafeCandidate(
+        pose,
+        predicted_x, predicted_y, predicted_yaw,
+        candidate.v, candidate.w,
+        static_cast<double>(turn_dir), original_v, original_w);
+
+      if (!found_safe_candidate || score > best_score) {
+        found_safe_candidate = true;
+        best_score = score;
+        best_v = candidate.v;
+        best_w = candidate.w;
+      }
+    }
+  }
+
+  if (found_safe_candidate) {
+    v = best_v;
+    w = best_w;
+    return true;
+  }
+
+  // 모든 대안이 막히면 안전을 위해 정지한다.
+  v = 0.0;
+  w = 0.0;
+  return false;
 }
 
 void RlLocalController::setSpeedLimit(const double & speed_limit, const bool & percentage)

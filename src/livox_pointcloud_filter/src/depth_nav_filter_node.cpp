@@ -85,8 +85,8 @@ public:
     declare_parameter<int>("ror_min_neighbors", 6);
 
     // 2~3프레임 정도 연속으로 보인 점만 obstacle 후보로 인정
-    declare_parameter<double>("temporal_voxel_size", 0.05);
-    declare_parameter<int>("temporal_min_hits", 2);
+    declare_parameter<double>("temporal_voxel_size", 0.05); // 5cm의 공간(voxel,칸)로 인식 
+    declare_parameter<int>("temporal_min_hits", 2); // 2에서 3프레임 인식 후 장애물로 인식 
     declare_parameter<double>("temporal_hit_window_sec", 0.35);
     declare_parameter<double>("temporal_max_stale_sec", 0.50);
 
@@ -159,12 +159,12 @@ private:
 
     for (const auto & kv : voxel_states_) {
       if ((now_sec - kv.second.last_seen_sec) > temporal_max_stale_sec_) {
-        stale_keys.push_back(kv.first);
+        stale_keys.push_back(kv.first); //오래된 voxel 수집 
       }
     }
 
     for (const auto & key : stale_keys) {
-      voxel_states_.erase(key);
+      voxel_states_.erase(key); // 오래된 voxel 제거 
     }
   }
 

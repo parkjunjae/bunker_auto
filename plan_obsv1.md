@@ -642,6 +642,278 @@ ros2 launch realsense2_camera rs_launch.py \
 
 - `depth_nav_filter_node`는 **raw depth를 받아 `base_link` 기준으로 옮긴 뒤, 로봇 자기 몸체/근거리 반사/바닥성 노이즈/희소 점/한 프레임짜리 깜빡이 점을 순서대로 제거해서 navigation용 point cloud만 다시 publish하는 노드**다.
 
+#### 현재 구현된 카메라 필터링 파이프라인 상세 [보강]
+
+이 문서에는 이전에도 “raw depth를 직접 쓰지 않고 filtered depth로 다시 넣는다”는 방향과 한 줄 요약은 들어 있었지만,  
+**실제로 지금 코드가 카메라를 어떤 순서와 어떤 값으로 필터링하는지**를 한눈에 따라갈 수 있는 섹션은 부족했다.  
+아래는 현재 워크스페이스 구현 기준의 실제 파이프라인이다.
+
+##### A. RealSense 드라이버 단계에서 먼저 거친 전처리
+
+파일:
+- `/home/atoz/ca_ws/run_all.sh`
+
+현재 `run_all.sh`에서 Realsense launch에 붙인 기본 옵션은 다음과 같다.
+
+```bash
+pointcloud.enable:=true
+align_depth.enable:=true
+enable_sync:=true
+clip_distance:=1.5
+decimation_filter.enable:=true
+decimation_filter.filter_magnitude:=2
+spatial_filter.enable:=true
+temporal_filter.enable:=true
+hole_filling_filter.enable:=false
+```
+
+의미:
+
+1. `align_depth.enable:=true`
+   - depth와 color 정렬을 맞춰 point cloud 기준 좌표 불일치를 줄인다.
+
+2. `enable_sync:=true`
+   - 프레임 타이밍 mismatch를 줄여 depth 프레임이 흔들리듯 섞이는 것을 완화한다.
+
+3. `clip_distance:=1.5`
+   - local obstacle에 직접 쓸 필요가 적은 원거리 depth를 upstream에서 먼저 잘라낸다.
+
+4. `decimation_filter.enable:=true`
+   - 점 수를 줄여 희소한 노이즈 점의 비중을 낮추고 후단 필터 계산량도 줄인다.
+
+5. `spatial_filter.enable:=true`
+   - 프레임 내부의 depth 흔들림을 줄인다.
+
+6. `temporal_filter.enable:=true`
+   - 프레임 간 flicker성 depth를 줄인다.
+
+7. `hole_filling_filter.enable:=false`
+   - [추론] 이 항목은 “없던 depth를 메워서” 가짜 obstacle blob을 키울 수 있어, navigation false positive 관점에서는 초기값으로 꺼 두는 편이 더 안전하다.
+
+즉 Realsense 쪽에서는 먼저 **정렬 / 동기화 / range clipping / 기본 spatial-temporal smoothing**만 하고,  
+가짜 장애물을 키울 수 있는 aggressive hole filling은 일부러 사용하지 않는다.
+
+##### B. raw depth point cloud를 nav 전용 point cloud로 다시 거르는 노드
+
+파일:
+- `/home/atoz/ca_ws/src/livox_pointcloud_filter/src/depth_nav_filter_node.cpp`
+
+입출력:
+- 입력: `/camera/camera/depth/color/points`
+- 출력: `/camera/camera/depth/color/nav_points`
+- target frame: `base_link`
+
+이 노드는 단순히 pointcloud를 한 번 더 publish하는 게 아니라,  
+**navigation에 직접 쓰면 위험한 depth를 `base_link` 기준으로 강하게 거르는 전용 필터**다.
+
+###### B-1. 먼저 `base_link` 기준으로 TF 변환
+
+코드상 첫 단계는 raw cloud를 `target_frame=base_link`로 바꾸는 것이다.
+
+이렇게 한 이유:
+- 로봇 자기 몸체 제거(self-mask)
+- 카메라 바로 앞 blind-zone 제거
+- 좌우/전방/높이 제한
+
+을 모두 **센서 프레임이 아니라 실제 로봇 기준 좌표로 직관적으로 처리**하기 위해서다.
+
+즉 지금 필터의 모든 핵심 판단은 “카메라가 뭘 보느냐”보다 **“그 점이 base_link 기준 어디에 있느냐”**에 기반한다.
+
+###### B-2. geometry filter로 명백한 오탐을 먼저 제거
+
+현재 값:
+
+```yaml
+min_x: -0.05
+max_x: 1.20
+max_abs_y: 1.00
+z_min: 0.10
+z_max: 1.20
+max_range: 1.20
+```
+
+의미:
+
+- `min_x=-0.05`, `max_x=1.20`
+  - 로봇 기준 지나치게 뒤쪽이거나 너무 먼 전방 점은 제거
+
+- `max_abs_y=1.00`
+  - 좌우 1m를 벗어나는 점은 local 회피 관점에서 우선 버림
+
+- `z_min=0.10`, `z_max=1.20`
+  - 바닥성 점, 지나치게 낮은 점, local obstacle로 과민하게 볼 필요가 적은 높은 점 제거
+
+- `max_range=1.20`
+  - depth는 LiDAR를 대체하는 장거리 센서가 아니라 **근거리 재질 보강 센서**로만 사용
+
+즉 이 단계는 **카메라를 전체 장애물 소스로 쓰지 않고, 로봇 근처에서 실제로 회피에 의미 있는 영역만 남기는 단계**다.
+
+###### B-3. self-mask로 로봇 자기 몸체/범퍼 근처 점 제거
+
+현재 값:
+
+```yaml
+self_mask_min_x: -0.67
+self_mask_max_x: 0.67
+self_mask_min_y: -0.44
+self_mask_max_y: 0.44
+```
+
+의미:
+- 로봇 footprint와 그 주변 마운트/범퍼/상판 에지에 해당할 수 있는 점을 아예 제거한다.
+
+[추론]
+- 이번 전방 blob은 footprint 바로 앞에 붙는 형태였기 때문에,
+- 센서가 자기 몸체 또는 바로 앞 에지를 잘못 본 점이 local obstacle로 들어갔을 가능성이 높았다.
+- 따라서 self-mask는 “보이는 장애물을 줄이는 필터”가 아니라 **로봇 자기 자신을 장애물로 오인하지 않게 하는 필터**다.
+
+###### B-4. 센서 바로 앞 blind-zone으로 근거리 반사/엣지 노이즈 제거
+
+현재 값:
+
+```yaml
+sensor_origin_x: 0.30
+sensor_origin_y: 0.00
+sensor_blind_radius: 0.18
+```
+
+의미:
+- 카메라 원점(대략 `base_link`보다 전방 30cm)에 대해
+- 반경 18cm 이내의 점은 제거한다.
+
+이 로직은 원형 거리 조건으로 구현되어 있다.
+
+```cpp
+const double dx = point.x - sensor_origin_x_;
+const double dy = point.y - sensor_origin_y_;
+if ((dx * dx + dy * dy) < sensor_blind_radius_sq_) {
+  return false;
+}
+```
+
+즉 카메라 바로 앞에서 생기는:
+- specular reflection
+- 근거리 depth hole 주변 edge noise
+- 센서 바로 앞에서 튀는 짧은 false cluster
+
+를 먼저 잘라낸다.
+
+###### B-5. VoxelGrid로 점군 밀도 정리
+
+현재 값:
+
+```yaml
+voxel_leaf_size: 0.04
+```
+
+의미:
+- 4cm 단위 voxel로 점군을 다운샘플한다.
+
+역할:
+- 계산량 감소
+- 불필요하게 조밀한 점군 완화
+- 이후 이웃 기반 필터(ROR)가 더 일관되게 동작하게 만듦
+
+###### B-6. ROR로 희소 점 제거
+
+현재 값:
+
+```yaml
+ror_radius: 0.10
+ror_min_neighbors: 6
+```
+
+의미:
+- 반경 10cm 안에 이웃이 충분히 없는 점은 제거한다.
+
+[추론]
+- 이번 false obstacle은 “생겼다가 없어지는 짧은 blob” 성격이었고,
+- 이런 오탐은 실제 물체 표면보다 훨씬 희소한 점군으로 나타나기 쉽다.
+- 따라서 ROR는 shiny/specular false point를 줄이는 데 중요한 중간 단계다.
+
+###### B-7. temporal confirmation으로 한 프레임짜리 깜빡이 점 제거
+
+현재 값:
+
+```yaml
+temporal_voxel_size: 0.05
+temporal_min_hits: 2
+temporal_hit_window_sec: 0.35
+temporal_max_stale_sec: 0.50
+```
+
+의미:
+- 5cm 공간 voxel 기준으로
+- 0.35초 안에 2번 이상 반복 관측된 점만 obstacle 후보로 인정한다.
+- 오래 안 보인 voxel은 0.5초 뒤 history를 지워 다시 처음부터 본다.
+
+이 단계의 목적은 아주 명확하다.
+
+- 한 프레임만 번쩍 보인 점
+- 다음 프레임에 사라지는 점
+- “생겼다가 없어졌다가 다시 생기는” flicker noise
+
+를 local obstacle layer에 보내지 않게 하는 것이다.
+
+즉 현재 카메라 필터 체인에서 **이번 전방 blob 증상과 가장 직접적으로 대응하는 단계**는 temporal confirmation이다.
+
+##### C. Nav2 local costmap은 이제 raw depth가 아니라 filtered depth만 사용
+
+파일:
+- `/home/atoz/ca_ws/src/rtabmap_ros/rtabmap_launch/launch/config/nav2_rtabmap_params.yaml`
+
+현재 local obstacle layer 설정:
+
+```yaml
+observation_sources: lidar_mark lidar_clear depth_mark_filtered
+```
+
+```yaml
+depth_mark_filtered:
+  topic: /camera/camera/depth/color/nav_points
+  data_type: PointCloud2
+  sensor_frame: base_link
+  marking: true
+  clearing: false
+  obstacle_range: 0.8
+  min_obstacle_height: 0.10
+  max_obstacle_height: 1.20
+  observation_persistence: 0.10
+```
+
+이 구조의 의미는 다음과 같다.
+
+1. 이제 local costmap은 raw `/camera/camera/depth/color/points`를 직접 보지 않는다.
+2. 대신 `depth_nav_filter_node`가 정제한 `/camera/camera/depth/color/nav_points`만 본다.
+3. `obstacle_range=0.8`로 줄여서 depth는 **근거리 보조 센서** 역할만 맡긴다.
+4. `observation_persistence=0.10`으로 줄여, 잘못 들어온 점이 오래 체류하지 않게 한다.
+
+즉 지금 카메라 depth는 더 이상 “LiDAR와 동급의 주 obstacle source”가 아니라,  
+**LiDAR가 놓칠 수 있는 glossy / dark / low-return 근거리 물체를 보강하는 좁은 역할**로 재정의되어 있다.
+
+##### D. 지금 카메라 필터링 로직의 전체 흐름 한 줄 정리
+
+현재 구현 기준 전체 흐름은 아래와 같다.
+
+```text
+Realsense raw depth
+-> align/sync/clip/spatial/temporal 기본 전처리
+-> /camera/camera/depth/color/points
+-> depth_nav_filter_node
+-> base_link 변환
+-> geometry filter
+-> self-mask
+-> sensor blind-zone
+-> voxel
+-> ROR
+-> temporal confirmation
+-> /camera/camera/depth/color/nav_points
+-> local_costmap.depth_mark_filtered
+```
+
+즉 지금 카메라는 “그냥 obstacle layer에 넣는 depth”가 아니라,  
+**upstream 전처리 + nav 전용 점군 필터 + local costmap 역할 축소**를 모두 거친 뒤에만 장애물 소스로 사용된다.
+
 
 ### 해결 4: shiny/specular 가구가 계속 문제면 하드웨어 광학 대책도 옵션이다
 
